@@ -95,6 +95,10 @@ def olx_callback():
     tokens = token_response.json()
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
+    supabase.table("olx_tokens").insert({
+    "access_token": access_token,
+    "refresh_token": refresh_token
+    }).execute()
     # NÃO mostramos os tokens no browser.
     # Nesta primeira fase apenas confirmamos que a autenticação funcionou.
 
