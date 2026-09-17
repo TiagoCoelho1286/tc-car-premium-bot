@@ -90,8 +90,8 @@ def olx_callback():
         ), 500
 
     tokens = token_response.json()
-access_token = tokens.get("access_token")
-refresh_token = tokens.get("refresh_token")
+    access_token = tokens.get("access_token")
+    refresh_token = tokens.get("refresh_token")
     # NÃO mostramos os tokens no browser.
     # Nesta primeira fase apenas confirmamos que a autenticação funcionou.
 
