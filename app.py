@@ -1,7 +1,7 @@
 import os
 import secrets
 import requests
-
+from supabase import create_client
 from flask import Flask, request, redirect, session
 
 app = Flask(__name__)
@@ -14,6 +14,9 @@ OLX_CLIENT_ID = os.environ.get("OLX_CLIENT_ID")
 OLX_CLIENT_SECRET = os.environ.get("OLX_CLIENT_SECRET")
 OLX_REDIRECT_URI = os.environ.get("OLX_REDIRECT_URI")
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
+supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 OLX_AUTHORIZE_URL = "https://www.olx.pt/oauth/authorize/"
 OLX_TOKEN_URL = "https://www.olx.pt/api/open/oauth/token"
 
