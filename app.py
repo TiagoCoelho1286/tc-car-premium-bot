@@ -111,6 +111,30 @@ def olx_callback():
 
     return "O OLX não devolveu um access token.", 500
 
+@app.route("/olx/mensagens")
+def olx_mensagens():
+    token_data = (
+        supabase.table("olx_tokens")
+        .select("access_token")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
 
+    if not token_data.data:
+        return "Não existe nenhum token OLX guardado.", 500
+
+    access_token = token_data.data[0]["access_token"]
+
+    response = requests.get(
+        "https://www.olx.pt/api/partner/threads",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+        },
+        timeout=20,
+    )
+
+    return response.text, response.status_code
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
