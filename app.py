@@ -136,5 +136,30 @@ def olx_mensagens():
     )
 
     return response.text, response.status_code
+@app.route("/olx/conversa/<thread_uuid>")
+def olx_conversa(thread_uuid):
+    token_data = (
+        supabase.table("olx_tokens")
+        .select("access_token")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not token_data.data:
+        return "Não existe nenhum token OLX guardado.", 500
+
+    access_token = token_data.data[0]["access_token"]
+
+    response = requests.get(
+        f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+        },
+        timeout=20,
+    )
+
+    return response.text, response.status_code
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
