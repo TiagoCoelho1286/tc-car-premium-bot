@@ -160,6 +160,35 @@ def olx_conversa(thread_uuid):
         timeout=20,
     )
 
+   return response.text, response.status_code
+@app.route("/olx/responder/<thread_uuid>")
+def olx_responder(thread_uuid):
+    token_data = (
+        supabase.table("olx_tokens")
+        .select("access_token")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not token_data.data:
+        return "Não existe nenhum token OLX guardado.", 500
+
+    access_token = token_data.data[0]["access_token"]
+
+    response = requests.post(
+        f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+            "Content-Type": "application/json",
+        },
+        json={
+            "text": "Olá! Esta é uma mensagem de teste do TC Car Premium Bot."
+        },
+        timeout=20,
+    )
+
     return response.text, response.status_code
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
