@@ -160,7 +160,7 @@ def olx_conversa(thread_uuid):
         timeout=20,
     )
 
-   return response.text, response.status_code
+return response.text, response.status_code
 @app.route("/olx/responder/<thread_uuid>")
 def olx_responder(thread_uuid):
     token_data = (
