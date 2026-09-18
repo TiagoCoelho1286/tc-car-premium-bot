@@ -219,7 +219,7 @@ def olx_novas():
 
     threads = response.json().get("data", [])
 
-      novas = []
+    novas = []
 
     for thread in threads:
         if thread.get("unread_count", 0) > 0:
