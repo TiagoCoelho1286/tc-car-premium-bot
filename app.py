@@ -221,7 +221,7 @@ def olx_novas():
 
     novas = []
 
-    for thread in threads:
+    for thread in threads[:5]:
         if thread.get("unread_count", 0) > 0:
             thread_uuid = thread.get("uuid")
 
