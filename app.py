@@ -190,5 +190,40 @@ def olx_responder(thread_uuid):
     )
 
     return response.text, response.status_code
+@app.route("/olx/novas")
+def olx_novas():
+    token_data = (
+        supabase.table("olx_tokens")
+        .select("access_token")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not token_data.data:
+        return "Não existe nenhum token OLX guardado.", 500
+
+    access_token = token_data.data[0]["access_token"]
+
+    response = requests.get(
+        "https://www.olx.pt/api/partner/threads",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+        },
+        timeout=20,
+    )
+
+    if not response.ok:
+        return response.text, response.status_code
+
+    threads = response.json().get("data", [])
+
+    novas = [
+        thread for thread in threads
+        if thread.get("unread_count", 0) > 0
+    ]
+
+    return {"total": len(novas), "conversas": novas}
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
