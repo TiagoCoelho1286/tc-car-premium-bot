@@ -257,9 +257,35 @@ def olx_novas():
 def olx_teste_auto():
     thread_uuid = "e7981905-33cd-4017-bd96-7ea16917dca0"
 
+    token_data = (
+        supabase.table("olx_tokens")
+        .select("access_token")
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+
+    if not token_data.data:
+        return "Não existe nenhum token OLX guardado.", 500
+
+    access_token = token_data.data[0]["access_token"]
+
+    response = requests.post(
+        f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+            "Content-Type": "application/json",
+        },
+        json={
+            "text": "Olá! Esta é uma resposta automática de teste do TC Car Premium Bot."
+        },
+        timeout=20,
+    )
+
     return {
-        "estado": "teste preparado",
-        "thread_uuid": thread_uuid
+        "codigo": response.status_code,
+        "resposta": response.text
     }
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
