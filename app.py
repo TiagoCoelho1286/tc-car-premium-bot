@@ -252,5 +252,14 @@ def olx_novas():
                     })
 
     return {"total": len(novas), "mensagens": novas}
+
+@app.route("/olx/teste-auto")
+def olx_teste_auto():
+    thread_uuid = "e7981905-33cd-4017-bd96-7ea16917dca0"
+
+    return {
+        "estado": "teste preparado",
+        "thread_uuid": thread_uuid
+    }
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
