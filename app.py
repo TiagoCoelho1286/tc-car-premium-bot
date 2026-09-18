@@ -219,11 +219,38 @@ def olx_novas():
 
     threads = response.json().get("data", [])
 
-    novas = [
-        thread for thread in threads
-        if thread.get("unread_count", 0) > 0
-    ]
+      novas = []
 
-    return {"total": len(novas), "conversas": novas}
+    for thread in threads:
+        if thread.get("unread_count", 0) > 0:
+            thread_uuid = thread.get("uuid")
+
+            messages_response = requests.get(
+                f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Version": "2.0",
+                },
+                timeout=20,
+            )
+
+            if messages_response.ok:
+                messages = messages_response.json().get("data", [])
+
+                recebidas = [
+                    message for message in messages
+                    if message.get("type") == "received"
+                    and not message.get("is_read", False)
+                ]
+
+                for message in recebidas:
+                    novas.append({
+                        "thread_uuid": thread_uuid,
+                        "advert_id": thread.get("advert_id"),
+                        "mensagem": message.get("text"),
+                        "data": message.get("created_at"),
+                    })
+
+    return {"total": len(novas), "mensagens": novas}
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
