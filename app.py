@@ -283,7 +283,7 @@ def olx_novas():
 
 @app.route("/olx/teste-auto")
 def olx_teste_auto():
-        token_data = (
+    token_data = (
         supabase.table("olx_tokens")
         .select("access_token")
         .order("created_at", desc=True)
@@ -291,7 +291,7 @@ def olx_teste_auto():
         .execute()
     )
 
-     if not token_data.data:
+    if not token_data.data:
         return "Não existe nenhum token OLX guardado.", 500
 
     access_token = token_data.data[0]["access_token"]
