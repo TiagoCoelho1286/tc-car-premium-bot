@@ -20,7 +20,35 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 OLX_AUTHORIZE_URL = "https://www.olx.pt/oauth/authorize/"
 OLX_TOKEN_URL = "https://www.olx.pt/api/open/oauth/token"
 
+def refresh_olx_token(refresh_token):
+    response = requests.post(
+        OLX_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "client_id": OLX_CLIENT_ID,
+            "client_secret": OLX_CLIENT_SECRET,
+            "refresh_token": refresh_token,
+        },
+        timeout=20,
+    )
 
+    if not response.ok:
+        return None
+
+    tokens = response.json()
+
+    new_access_token = tokens.get("access_token")
+    new_refresh_token = tokens.get("refresh_token", refresh_token)
+
+    if not new_access_token:
+        return None
+
+    supabase.table("olx_tokens").insert({
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token
+    }).execute()
+
+    return new_access_token
 @app.route("/")
 def home():
     return """
