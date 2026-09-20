@@ -285,7 +285,7 @@ def olx_novas():
 def olx_teste_auto():
     token_data = (
         supabase.table("olx_tokens")
-        .select("access_token")
+        .select("access_token, refresh_token")
         .order("created_at", desc=True)
         .limit(1)
         .execute()
@@ -295,6 +295,7 @@ def olx_teste_auto():
         return "Não existe nenhum token OLX guardado.", 500
 
     access_token = token_data.data[0]["access_token"]
+    refresh_token = token_data.data[0]["refresh_token"]
 
     novas_response = requests.get(
         "https://www.olx.pt/api/partner/threads",
@@ -305,8 +306,22 @@ def olx_teste_auto():
         timeout=20,
     )
 
+    if novas_response.status_code == 401:
+        access_token = refresh_olx_token(refresh_token)
+
+        if not access_token:
+            return "Não foi possível renovar o token OLX.", 500
+
+        novas_response = requests.get(
+            "https://www.olx.pt/api/partner/threads",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Version": "2.0",
+            },
+            timeout=20,
+        )
+
     return {
-        "estado": "teste automático preparado"
+        "estado": "teste automático preparado",
+        "codigo_olx": novas_response.status_code
     }
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
