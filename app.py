@@ -291,10 +291,11 @@ def olx_teste_auto():
         .execute()
     )
 
-    if not token_data.data:
+     if not token_data.data:
         return "Não existe nenhum token OLX guardado.", 500
 
     access_token = token_data.data[0]["access_token"]
+
     novas_response = requests.get(
         "https://www.olx.pt/api/partner/threads",
         headers={
