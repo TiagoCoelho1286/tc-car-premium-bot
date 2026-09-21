@@ -321,7 +321,20 @@ def olx_teste_auto():
             timeout=20,
         )
 
+    if not novas_response.ok:
+        return {
+            "erro": "Erro ao obter conversas do OLX",
+            "codigo_olx": novas_response.status_code
+        }, 500
+
+    threads = novas_response.json().get("data", [])
+
     return {
         "estado": "teste automático preparado",
-        "codigo_olx": novas_response.status_code
+        "codigo_olx": novas_response.status_code,
+        "threads_encontradas": len(threads)
     }
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
