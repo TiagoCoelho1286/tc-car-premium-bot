@@ -328,41 +328,40 @@ def olx_teste_auto():
         }, 500
 
     threads = novas_response.json().get("data", [])
-
     mensagens_encontradas = []
 
-for thread in threads[:5]:
-    if thread.get("unread_count", 0) > 0:
-        thread_uuid = thread.get("uuid")
-        advert_id = thread.get("advert_id")
+    for thread in threads[:5]:
+        if thread.get("unread_count", 0) > 0:
+            thread_uuid = thread.get("uuid")
+            advert_id = thread.get("advert_id")
 
-        messages_response = requests.get(
-            f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Version": "2.0",
-            },
-            timeout=20,
-        )
+            messages_response = requests.get(
+                f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Version": "2.0",
+                },
+                timeout=20,
+            )
 
-        if messages_response.ok:
-            messages = messages_response.json().get("data", [])
+            if messages_response.ok:
+                messages = messages_response.json().get("data", [])
 
-            for message in messages:
-                if message.get("type") == "received" and not message.get("is_read", False):
-                    mensagens_encontradas.append({
-                        "message_id": message.get("id"),
-                        "thread_uuid": thread_uuid,
-                        "advert_id": advert_id,
-                        "texto": message.get("text"),
-                    })
+                for message in messages:
+                    if message.get("type") == "received" and not message.get("is_read", False):
+                        mensagens_encontradas.append({
+                            "message_id": message.get("id"),
+                            "thread_uuid": thread_uuid,
+                            "advert_id": advert_id,
+                            "texto": message.get("text"),
+                        })
 
-        return {
-            "estado": "mensagens verificadas",
-            "threads_encontradas": len(threads),
-            "mensagens_encontradas": len(mensagens_encontradas),
-            "mensagens": mensagens_encontradas
-        }
+    return {
+        "estado": "mensagens verificadas",
+        "threads_encontradas": len(threads),
+        "mensagens_encontradas": len(mensagens_encontradas),
+        "mensagens": mensagens_encontradas
+    }
 
 
 if __name__ == "__main__":
