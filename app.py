@@ -348,7 +348,7 @@ def olx_teste_auto():
                 messages = messages_response.json().get("data", [])
 
                 for message in messages:
-                    if message.get("type") == "received" and not message.get("is_read", False):
+                   if message.get("type") == "received":
                         mensagens_encontradas.append({
                             "message_id": message.get("id"),
                             "thread_uuid": thread_uuid,
