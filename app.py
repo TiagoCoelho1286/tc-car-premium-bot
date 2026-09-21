@@ -357,12 +357,12 @@ for thread in threads[:5]:
                         "texto": message.get("text"),
                     })
 
-    return {
-        "estado": "mensagens verificadas",
-        "threads_encontradas": len(threads),
-        "mensagens_encontradas": len(mensagens_encontradas),
-        "mensagens": mensagens_encontradas
-    }
+        return {
+            "estado": "mensagens verificadas",
+            "threads_encontradas": len(threads),
+            "mensagens_encontradas": len(mensagens_encontradas),
+            "mensagens": mensagens_encontradas
+        }
 
 
 if __name__ == "__main__":
