@@ -357,12 +357,10 @@ def olx_teste_auto():
                         })
 
     return {
-        "estado": "mensagens verificadas",
-        "threads_encontradas": len(threads),
-        "mensagens_encontradas": len(mensagens_encontradas),
-        "mensagens": mensagens_encontradas
-    }
-
+    "estado": "debug mensagens OLX",
+    "threads_encontradas": len(threads),
+    "resposta_mensagens_olx": messages_response.json() if 'messages_response' in locals() else None
+}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
