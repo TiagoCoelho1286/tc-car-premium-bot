@@ -3,7 +3,8 @@ import secrets
 import requests
 from supabase import create_client
 from flask import Flask, request, redirect, session
-
+from datetime import datetime
+from zoneinfo import ZoneInfo
 app = Flask(__name__)
 
 # Chave usada apenas para proteger a sessão do browser.
@@ -355,12 +356,26 @@ def olx_teste_auto():
                         "advert_id": advert_id,
                         "texto": message.get("text"),
                     })
+        hora = datetime.now(ZoneInfo("Europe/Lisbon")).hour
 
-        return {
+    if hora < 12:
+        saudacao = "Bom dia."
+    elif hora < 20:
+        saudacao = "Boa tarde."
+    else:
+        saudacao = "Boa noite."
+
+    for mensagem in mensagens_encontradas:
+        texto = (mensagem.get("texto") or "").lower()
+
+        if "disponível" in texto or "disponivel" in texto:
+            mensagem["resposta"] = f"{saudacao} Sim, a viatura continua disponível. Em que podemos ajudar?"
+
+    return {
         "estado": "mensagens verificadas",
         "threads_encontradas": len(threads),
         "mensagens_encontradas": len(mensagens_encontradas),
         "mensagens": mensagens_encontradas
-    }
+    }       
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
