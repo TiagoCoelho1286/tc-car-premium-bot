@@ -367,7 +367,7 @@ return {
     "total_threads": len(threads),
     "diagnostico_threads": diagnostico_threads
 }
-            hora = datetime.now(ZoneInfo("Europe/Lisbon")).hour
+            
 
     if hora < 12:
         saudacao = "Bom dia."
