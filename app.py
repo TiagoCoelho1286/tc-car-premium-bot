@@ -327,10 +327,7 @@ def olx_teste_auto():
             "erro": "Erro ao obter conversas do OLX",
             "codigo_olx": novas_response.status_code
         }, 500
-        return {
-        "status_code": novas_response.status_code,
-        "resposta_completa_olx": novas_response.json()
-    }
+       
     threads = novas_response.json().get("data", [])
     mensagens_encontradas = []
 
