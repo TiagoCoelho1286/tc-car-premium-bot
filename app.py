@@ -356,7 +356,7 @@ def olx_teste_auto():
                         "advert_id": advert_id,
                         "texto": message.get("text"),
                     })
-        hora = datetime.now(ZoneInfo("Europe/Lisbon")).hour
+            hora = datetime.now(ZoneInfo("Europe/Lisbon")).hour
 
     if hora < 12:
         saudacao = "Bom dia."
@@ -368,14 +368,151 @@ def olx_teste_auto():
     for mensagem in mensagens_encontradas:
         texto = (mensagem.get("texto") or "").lower()
 
-        if "disponível" in texto or "disponivel" in texto:
-            mensagem["resposta"] = f"{saudacao} Sim, a viatura continua disponível. Em que podemos ajudar?"
+        # DISPONIBILIDADE
+        if any(p in texto for p in [
+            "disponível", "disponivel", "ainda está disponível",
+            "ainda esta disponivel", "ainda tem o carro",
+            "ainda tem a viatura", "já vendeu", "ja vendeu"
+        ]):
+            resposta = (
+                f"{saudacao} Sim, a viatura continua disponível. "
+                "Onde podemos ajudar?"
+            )
+
+        # PREÇO NEGOCIÁVEL
+        elif any(p in texto for p in [
+            "negociável", "negociavel", "preço negociável",
+            "preco negociavel", "faz desconto", "baixa o preço",
+            "baixa o preco", "melhor preço", "melhor preco",
+            "mínimo", "minimo", "último preço", "ultimo preco"
+        ]):
+            resposta = (
+                f"{saudacao} Existe alguma margem para negociação, "
+                "mas preferimos falar sobre valores depois de ver a viatura. "
+                "Onde podemos ajudar?"
+            )
+
+        # RETOMA
+        elif any(p in texto for p in [
+            "retoma", "aceitam retoma", "aceita retoma",
+            "troca", "dar o meu carro", "dar a minha viatura"
+        ]):
+            resposta = (
+                f"{saudacao} Sim, podemos avaliar uma possível retoma. "
+                "Envie-nos, por favor, algumas fotografias da viatura, "
+                "marca, modelo, ano, quilometragem e motorização para o "
+                "WhatsApp 962 148 367 e fazemos uma avaliação."
+            )
+
+        # FINANCIAMENTO
+        elif any(p in texto for p in [
+            "financiamento", "financiam", "financiar",
+            "crédito", "credito", "prestações", "prestacoes",
+            "mensalidade"
+        ]):
+            resposta = (
+                f"{saudacao} De momento estamos a atualizar as nossas "
+                "soluções de financiamento, pelo que temporariamente não "
+                "estamos a realizar novos processos. Prevemos voltar a "
+                "disponibilizar esta opção em breve."
+            )
+
+        # LOCALIZAÇÃO / ONDE VER A VIATURA
+        elif any(p in texto for p in [
+            "onde estão", "onde estao", "onde fica",
+            "localização", "localizacao", "morada",
+            "onde posso ver", "onde ver", "onde têm os carros",
+            "onde tem os carros"
+        ]):
+            resposta = (
+                f"{saudacao} Pode ver a viatura mediante marcação na "
+                "Ruela da Cavada Nova, n.º 74, 4585-053 Baltar, Paredes. "
+                "Se pretender, podemos combinar um dia e horário."
+            )
+
+        # GARANTIA
+        elif any(p in texto for p in [
+            "garantia", "tem garantia", "quanto tempo de garantia",
+            "quantos meses de garantia"
+        ]):
+            resposta = (
+                f"{saudacao} As condições de garantia dependem da viatura "
+                "e das condições da venda. Quando aplicável, trabalhamos "
+                "com garantia até 18 meses. Podemos confirmar as condições "
+                "específicas desta viatura."
+            )
+
+        # MARCAÇÃO / VISITA / TEST-DRIVE
+        elif any(p in texto for p in [
+            "posso ir ver", "quero ver", "marcar",
+            "marcação", "marcacao", "visitar",
+            "visita", "test drive", "experimentar",
+            "posso experimentar"
+        ]):
+            resposta = (
+                f"{saudacao} Claro. Podemos combinar uma visita para ver "
+                "a viatura e esclarecer todas as questões. "
+                "Indique-nos, por favor, o dia e horário que lhe dão mais jeito."
+            )
+
+        # MAIS FOTOS / VÍDEO
+        elif any(p in texto for p in [
+            "mais fotos", "mais fotografias", "fotos",
+            "fotografias", "vídeo", "video"
+        ]):
+            resposta = (
+                f"{saudacao} Claro. Podemos enviar mais fotografias ou vídeos "
+                "da viatura. Diga-nos que detalhes pretende ver ou contacte-nos "
+                "pelo WhatsApp 962 148 367."
+            )
+
+        # QUILÓMETROS
+        elif any(p in texto for p in [
+            "quilómetros", "quilometros", "km",
+            "quantos kms", "quantos km"
+        ]):
+            resposta = (
+                f"{saudacao} A quilometragem encontra-se indicada no anúncio. "
+                "Se tiver alguma questão específica sobre o histórico da viatura, "
+                "podemos esclarecer."
+            )
+
+        # HISTÓRICO / MANUTENÇÃO
+        elif any(p in texto for p in [
+            "histórico", "historico", "revisões", "revisoes",
+            "manutenção", "manutencao", "livro de revisões",
+            "livro de revisoes"
+        ]):
+            resposta = (
+                f"{saudacao} Podemos esclarecer toda a informação disponível "
+                "sobre o histórico e manutenção desta viatura. "
+                "Diga-nos concretamente o que pretende saber."
+            )
+
+        # CONTACTO / TELEFONE / WHATSAPP
+        elif any(p in texto for p in [
+            "contacto", "telefone", "telemóvel", "telemovel",
+            "whatsapp", "número", "numero"
+        ]):
+            resposta = (
+                f"{saudacao} Pode contactar-nos através do WhatsApp "
+                "pelo número 962 148 367. Onde podemos ajudar?"
+            )
+
+        # RESPOSTA GENÉRICA
+        else:
+            resposta = (
+                f"{saudacao} Obrigado pelo seu contacto com a TC Car Premium. "
+                "Onde podemos ajudar?"
+            )
+
+        mensagem["resposta"] = resposta
 
     return {
         "estado": "mensagens verificadas",
         "threads_encontradas": len(threads),
         "mensagens_encontradas": len(mensagens_encontradas),
         "mensagens": mensagens_encontradas
-    }       
+    }
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
