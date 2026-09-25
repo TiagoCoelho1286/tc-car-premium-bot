@@ -329,6 +329,16 @@ def olx_teste_auto():
         }, 500
        
     threads = novas_response.json().get("data", [])
+    return {
+    "total_threads_api": len(threads),
+    "threads": [
+        {
+            "uuid": t.get("uuid"),
+            "advert_id": t.get("advert_id")
+        }
+        for t in threads
+    ]
+}
     mensagens_encontradas = []
 
     for thread in threads[:5]:
