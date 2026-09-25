@@ -340,32 +340,33 @@ def olx_teste_auto():
     ]
 }
     mensagens_encontradas = []
+diagnostico_threads = []
 
-    for thread in threads[:5]:
-       
-        thread_uuid = thread.get("uuid")
-        advert_id = thread.get("advert_id")
+for thread in threads[:5]:
 
-        messages_response = requests.get(
-            f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Version": "2.0",
-            },
-            timeout=20,
-        )
+    thread_uuid = thread.get("uuid")
+    advert_id = thread.get("advert_id")
 
-        if messages_response.ok:
-            messages = messages_response.json().get("data", [])
+    messages_response = requests.get(
+        f"https://www.olx.pt/api/partner/threads/{thread_uuid}/messages",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2.0",
+        },
+        timeout=20,
+    )
 
-            for message in messages:
-               if message.get("type") == "received":
-                    mensagens_encontradas.append({
-                        "message_id": message.get("id"),
-                        "thread_uuid": thread_uuid,
-                        "advert_id": advert_id,
-                        "texto": message.get("text"),
-                    })
+    diagnostico_threads.append({
+        "advert_id": advert_id,
+        "thread_uuid": thread_uuid,
+        "status_messages": messages_response.status_code,
+        "resposta_messages": messages_response.json()
+    })
+
+return {
+    "total_threads": len(threads),
+    "diagnostico_threads": diagnostico_threads
+}
             hora = datetime.now(ZoneInfo("Europe/Lisbon")).hour
 
     if hora < 12:
