@@ -416,7 +416,7 @@ def process_new_messages():
         replies_sent = 0
         messages_marked = 0
         errors = []
-
+        print("DEBUG OLX THREADS:", threads, flush=True)
         for thread in threads:
             thread_uuid = thread.get("uuid") or thread.get("id")
             advert_id = thread.get("advert_id")
