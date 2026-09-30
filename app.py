@@ -335,6 +335,7 @@ def get_messages(thread_uuid, access_token, refresh_token):
         raise RuntimeError(
             f"Erro OLX ao obter mensagens: HTTP {response.status_code} - {response.text[:300]}"
         )
+        print("DEBUG OLX MESSAGES:", response.status_code, response.text[:5000], flush=True)
     return api_items(response), access_token, refresh_token
 
 
