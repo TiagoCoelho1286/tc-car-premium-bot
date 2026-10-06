@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 import threading
@@ -32,6 +33,8 @@ OLX_API_BASE = "https://www.olx.pt/api/partner"
 
 POLL_SECONDS = max(30, int(os.environ.get("POLL_SECONDS", "60")))
 AUTO_POLL = os.environ.get("AUTO_POLL", "true").lower() in {"1", "true", "yes", "sim"}
+
+OLX_DEBUG = os.environ.get("OLX_DEBUG", "true").lower() in {"1", "true", "yes", "sim"}
 
 INITIALIZED_SENTINEL = "__TC_CAR_PREMIUM_BOT_INITIALIZED__"
 process_lock = threading.Lock()
@@ -305,6 +308,50 @@ def build_reply(text):
     )
 
 
+def debug_log(*parts):
+    if OLX_DEBUG:
+        print("[DEBUG]", *parts, flush=True)
+
+
+_SAFE_MESSAGE_FIELDS = ("id", "uuid", "thread_id", "type", "is_read", "created_at")
+
+
+def debug_shape(label, response, batch):
+    """Mostra o formato real da resposta (sem conteúdo pessoal)."""
+    try:
+        payload = response.json()
+    except Exception:
+        debug_log(f"{label}: HTTP {response.status_code} resposta NÃO é JSON: {response.text[:150]!r}")
+        return
+    if isinstance(payload, list):
+        formato = "lista"
+    elif isinstance(payload, dict):
+        formato = "dict com chaves " + str(sorted(payload.keys()))
+        if not isinstance(payload.get("data"), list):
+            formato += " (ATENÇÃO: sem lista em 'data' -> o bot vê 0 itens)"
+    else:
+        formato = type(payload).__name__
+    debug_log(f"{label}: HTTP {response.status_code} formato={formato} itens={len(batch)}")
+
+
+def debug_thread(thread, messages, stats, pending):
+    pending_ids = {message_key(m) for m in pending}
+    debug_log(
+        f"thread={item_key(thread)} advert={thread.get('advert_id')} "
+        f"unread_count={thread.get('unread_count')} total_count={thread.get('total_count')} "
+        f"campos_thread={sorted(thread.keys())}"
+    )
+    debug_log(f"  contagem={json.dumps(stats, ensure_ascii=False)}")
+    recentes = sorted(messages, key=lambda m: str(m.get("created_at")))[-3:]
+    for m in recentes:
+        info = {k: m.get(k) for k in _SAFE_MESSAGE_FIELDS if k in m}
+        info["text_len"] = len(m.get("text") or "")
+        info["outros_campos"] = sorted(k for k in m.keys() if k not in _SAFE_MESSAGE_FIELDS)
+        info["chave_usada"] = message_key(m)
+        info["pendente_de_resposta"] = message_key(m) in pending_ids
+        debug_log("  msg " + json.dumps(info, ensure_ascii=False, default=str))
+
+
 def item_key(item):
     for field in ("uuid", "id"):
         if item.get(field) is not None:
@@ -336,6 +383,8 @@ def fetch_all(path, label, access_token, refresh_token, limit=100,
             )
 
         batch = api_items(response)
+        if offset == 0:
+            debug_shape(label, response, batch)
         if not batch:
             break
 
@@ -449,6 +498,7 @@ def process_new_messages():
         replies_sent = 0
         messages_marked = 0
         errors = []
+        thread_debug = []
         unread_total = sum(int(t.get("unread_count") or 0) for t in threads)
         print(
             f"[BOT] threads={len(threads)} nao_lidas={unread_total} "
@@ -471,12 +521,36 @@ def process_new_messages():
                 continue
 
             pending = []
+            stats = {
+                "mensagens": len(messages),
+                "recebidas": 0,
+                "enviadas": 0,
+                "outros_tipos": {},
+                "sem_id": 0,
+                "ja_processadas": 0,
+            }
             for message in messages:
-                if message.get("type") != "received":
+                mtype = message.get("type")
+                if mtype == "received":
+                    stats["recebidas"] += 1
+                elif mtype == "sent":
+                    stats["enviadas"] += 1
+                else:
+                    key = str(mtype)
+                    stats["outros_tipos"][key] = stats["outros_tipos"].get(key, 0) + 1
+                if mtype != "received":
                     continue
                 mid = message_key(message)
-                if mid and not is_processed(mid):
+                if not mid:
+                    stats["sem_id"] += 1
+                    continue
+                if is_processed(mid):
+                    stats["ja_processadas"] += 1
+                else:
                     pending.append(message)
+            stats["pendentes"] = len(pending)
+            thread_debug.append({"thread": str(thread_uuid), "unread_count": thread.get("unread_count"), **stats})
+            debug_thread(thread, messages, stats, pending)
 
             if not pending:
                 continue
@@ -521,6 +595,7 @@ def process_new_messages():
             "respostas_enviadas": replies_sent,
             "mensagens_processadas": messages_marked,
             "erros": errors,
+            **({"debug_threads": thread_debug} if OLX_DEBUG else {}),
         }
 
     except Exception as exc:
