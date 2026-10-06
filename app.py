@@ -48,6 +48,15 @@ def api_items(response):
     return []
 
 
+def api_items_from(payload):
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        data = payload.get("data", [])
+        return data if isinstance(data, list) else []
+    return []
+
+
 def get_latest_tokens():
     token_data = (
         supabase.table("olx_tokens")
@@ -296,47 +305,71 @@ def build_reply(text):
     )
 
 
-def get_threads(access_token, refresh_token):
-    # Paginação para não ficarmos limitados apenas às primeiras conversas.
-    all_threads = []
-    offset = 0
-    limit = 100
+def item_key(item):
+    for field in ("uuid", "id"):
+        if item.get(field) is not None:
+            return str(item[field])
+    return None
 
-    while True:
+
+def fetch_all(path, label, access_token, refresh_token, limit=100,
+              stop_on_short_page=False, max_pages=50):
+    """
+    Pagina com offset/limit. O offset avança pelo número de itens realmente
+    recebidos (e não por 'limit'), por isso funciona mesmo que o servidor
+    limite o tamanho da página. Pára quando a página vem vazia, quando não traz
+    nada de novo, ou (opcional) quando vem mais curta que 'limit'.
+    """
+    items, seen, offset = [], set(), 0
+
+    for _ in range(max_pages):
         response, access_token, refresh_token = olx_request(
             "GET",
-            f"/threads?offset={offset}&limit={limit}",
+            path,
             access_token,
             refresh_token,
+            params={"offset": offset, "limit": limit},
         )
         if not response.ok:
             raise RuntimeError(
-                f"Erro OLX ao obter conversas: HTTP {response.status_code} - {response.text[:300]}"
+                f"Erro OLX ao obter {label}: HTTP {response.status_code} - {response.text[:300]}"
             )
 
         batch = api_items(response)
-        all_threads.extend(batch)
-
-        if len(batch) < limit:
+        if not batch:
             break
-        offset += limit
 
-    return all_threads, access_token, refresh_token
+        new_items = 0
+        for item in batch:
+            key = item_key(item)
+            if key is not None and key in seen:
+                continue
+            if key is not None:
+                seen.add(key)
+            items.append(item)
+            new_items += 1
+
+        if new_items == 0:
+            break
+        if stop_on_short_page and len(batch) < limit:
+            break
+        offset += len(batch)
+
+    return items, access_token, refresh_token
+
+
+def get_threads(access_token, refresh_token):
+    return fetch_all("/threads", "conversas", access_token, refresh_token)
 
 
 def get_messages(thread_uuid, access_token, refresh_token):
-    response, access_token, refresh_token = olx_request(
-        "GET",
+    return fetch_all(
         f"/threads/{thread_uuid}/messages",
+        "mensagens",
         access_token,
         refresh_token,
+        stop_on_short_page=True,
     )
-    if not response.ok:
-        raise RuntimeError(
-            f"Erro OLX ao obter mensagens: HTTP {response.status_code} - {response.text[:300]}"
-        )
-        print("DEBUG OLX MESSAGES:", response.status_code, response.text[:5000], flush=True)
-    return api_items(response), access_token, refresh_token
 
 
 def send_message(thread_uuid, text, access_token, refresh_token):
@@ -416,7 +449,12 @@ def process_new_messages():
         replies_sent = 0
         messages_marked = 0
         errors = []
-        print("DEBUG OLX THREADS:", threads, flush=True)
+        unread_total = sum(int(t.get("unread_count") or 0) for t in threads)
+        print(
+            f"[BOT] threads={len(threads)} nao_lidas={unread_total} "
+            f"ids={[item_key(t) for t in threads][:20]}",
+            flush=True,
+        )
         for thread in threads:
             thread_uuid = thread.get("uuid") or thread.get("id")
             advert_id = thread.get("advert_id")
@@ -479,6 +517,7 @@ def process_new_messages():
         return {
             "estado": "ok",
             "threads_verificadas": len(threads),
+            "mensagens_nao_lidas_api": unread_total,
             "respostas_enviadas": replies_sent,
             "mensagens_processadas": messages_marked,
             "erros": errors,
@@ -592,6 +631,133 @@ def olx_callback():
 def olx_processar():
     # Rota útil para teste e também para um monitor externo chamar periodicamente.
     return jsonify(process_new_messages())
+
+
+def _mask(value):
+    value = str(value or "")
+    if "@" in value:
+        name, domain = value.split("@", 1)
+        return (name[:2] + "***@" + domain) if name else "***@" + domain
+    return (value[:2] + "***") if value else ""
+
+
+def _probe(path, access_token, refresh_token, **kwargs):
+    """GET só de leitura. Devolve (resumo, payload, access_token, refresh_token)."""
+    response, access_token, refresh_token = olx_request(
+        "GET", path, access_token, refresh_token, **kwargs
+    )
+    info = {"http": response.status_code}
+    payload = None
+    try:
+        payload = response.json()
+    except Exception:
+        info["corpo_nao_json"] = response.text[:200]
+    if isinstance(payload, dict):
+        info["formato"] = "dict com chaves: " + ", ".join(sorted(payload.keys()))
+    elif isinstance(payload, list):
+        info["formato"] = "lista"
+    if not response.ok:
+        info["erro"] = response.text[:300]
+    return info, payload, access_token, refresh_token
+
+
+@app.route("/olx/diagnostico")
+def olx_diagnostico():
+    """
+    Diagnóstico só de leitura (não envia mensagens, não escreve na BD).
+    Mostra a que conta pertence o token e exatamente o que o OLX devolve.
+    Remover/proteger depois de resolvido.
+    """
+    out = {}
+    try:
+        rows = (
+            supabase.table("olx_tokens")
+            .select("created_at")
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+        out["tokens_guardados_ultimos_5"] = [r.get("created_at") for r in rows.data]
+
+        access_token, refresh_token = get_latest_tokens()
+        if not access_token:
+            return jsonify({"erro": "Não existe nenhum token OLX guardado."})
+
+        # 1) A que conta pertence o token?
+        info, payload, access_token, refresh_token = _probe(
+            "/users/me", access_token, refresh_token
+        )
+        me = payload.get("data", payload) if isinstance(payload, dict) else {}
+        info["id"] = me.get("id")
+        info["nome"] = me.get("name")
+        info["email_mascarado"] = _mask(me.get("email"))
+        out["conta_do_token"] = info
+
+        # 2) Anúncios visíveis para este token
+        info, payload, access_token, refresh_token = _probe(
+            "/adverts", access_token, refresh_token, params={"offset": 0, "limit": 100}
+        )
+        adverts = api_items_from(payload)
+        info["total_devolvido"] = len(adverts)
+        info["amostra"] = [
+            {"id": a.get("id"), "titulo": (a.get("title") or "")[:40], "estado": a.get("status")}
+            for a in adverts[:5]
+        ]
+        out["anuncios"] = info
+
+        # 3) /threads em 3 variantes, para detetar filtragem no servidor
+        variantes = {
+            "sem_parametros": None,
+            "offset0_limit100": {"offset": 0, "limit": 100},
+            "offset0_limit10": {"offset": 0, "limit": 10},
+        }
+        threads_ref = []
+        out["threads"] = {}
+        for nome, params in variantes.items():
+            kw = {"params": params} if params else {}
+            info, payload, access_token, refresh_token = _probe(
+                "/threads", access_token, refresh_token, **kw
+            )
+            lst = api_items_from(payload)
+            info["total_devolvido"] = len(lst)
+            info["ids"] = [item_key(t) for t in lst][:30]
+            info["nao_lidas"] = sum(int(t.get("unread_count") or 0) for t in lst)
+            out["threads"][nome] = info
+            if nome == "offset0_limit100":
+                threads_ref = lst
+
+        # 4) Estrutura real de um thread + última mensagem de cada um (sem texto)
+        if threads_ref:
+            out["campos_de_um_thread"] = sorted(threads_ref[0].keys())
+        detalhe = []
+        for t in threads_ref[:10]:
+            tid = item_key(t)
+            info, payload, access_token, refresh_token = _probe(
+                f"/threads/{tid}/messages", access_token, refresh_token,
+                params={"offset": 0, "limit": 100},
+            )
+            msgs = api_items_from(payload)
+            datas = sorted(str(m.get("created_at")) for m in msgs if m.get("created_at"))
+            detalhe.append(
+                {
+                    "thread": tid,
+                    "advert_id": t.get("advert_id"),
+                    "interlocutor_id": t.get("interlocutor_id"),
+                    "criado_em": t.get("created_at"),
+                    "total_count": t.get("total_count"),
+                    "unread_count": t.get("unread_count"),
+                    "http_mensagens": info["http"],
+                    "mensagens_devolvidas": len(msgs),
+                    "recebidas": sum(1 for m in msgs if m.get("type") == "received"),
+                    "mais_antiga": datas[0] if datas else None,
+                    "mais_recente": datas[-1] if datas else None,
+                }
+            )
+        out["detalhe_threads"] = detalhe
+        return jsonify(out)
+    except Exception as exc:
+        out["erro"] = str(exc)
+        return jsonify(out), 500
 
 
 @app.route("/olx/estado")
