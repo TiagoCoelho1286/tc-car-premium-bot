@@ -1,9 +1,11 @@
 import json
 import os
+import re
 import secrets
 import threading
 import time
-from datetime import datetime
+import unicodedata
+from datetime import datetime, timezone
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -37,6 +39,10 @@ AUTO_POLL = os.environ.get("AUTO_POLL", "true").lower() in {"1", "true", "yes", 
 OLX_DEBUG = os.environ.get("OLX_DEBUG", "true").lower() in {"1", "true", "yes", "sim"}
 
 INITIALIZED_SENTINEL = "__TC_CAR_PREMIUM_BOT_INITIALIZED__"
+BASELINE_PREFIX = "__TC_CAR_PREMIUM_BASELINE__|"
+MAX_REPLIES_PER_RUN = max(1, int(os.environ.get("MAX_REPLIES_PER_RUN", "10")))
+ADVERT_CACHE_SECONDS = 600
+_REPLIED_IDS = set()
 process_lock = threading.Lock()
 
 
@@ -191,121 +197,350 @@ def greeting():
     return "Boa noite."
 
 
-def build_reply(text):
-    texto = (text or "").lower()
-    saudacao = greeting()
+# ---------------------------------------------------------------------------
+# Datas (o OLX devolve created_at como texto, ex.: "2026-10-06 21:24:54")
+# ---------------------------------------------------------------------------
+def parse_ts(value):
+    """Converte created_at em datetime 'naive'. Devolve None se não perceber."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = value / 1000 if value > 1e11 else value
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).replace(tzinfo=None)
+        except (OverflowError, OSError, ValueError):
+            return None
 
-    if any(p in texto for p in [
-        "disponível", "disponivel", "ainda está disponível",
-        "ainda esta disponivel", "ainda tem o carro",
-        "ainda tem a viatura", "já vendeu", "ja vendeu",
-    ]):
-        return f"{saudacao} Sim, a viatura continua disponível. Onde podemos ajudar?"
+    text = str(value).strip()
+    if not text or text.upper() == "NONE":
+        return None
+    text = text.replace("Z", "+00:00")
 
-    if any(p in texto for p in [
-        "negociável", "negociavel", "preço negociável", "preco negociavel",
-        "faz desconto", "baixa o preço", "baixa o preco", "melhor preço",
-        "melhor preco", "mínimo", "minimo", "último preço", "ultimo preco",
-    ]):
-        return (
-            f"{saudacao} Existe alguma margem para negociação, "
-            "mas preferimos falar sobre valores depois de ver a viatura. "
-            "Onde podemos ajudar?"
+    dt = None
+    try:
+        dt = datetime.fromisoformat(text.replace(" ", "T", 1))
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+            try:
+                dt = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+# ---------------------------------------------------------------------------
+# Dados do anúncio (preço e quilometragem)
+# ---------------------------------------------------------------------------
+_ADVERT_CACHE = {}
+
+
+def _to_number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = re.sub(r"[^\d,.\-]", "", value)
+        if not cleaned:
+            return None
+        if "," in cleaned and "." in cleaned:
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif "," in cleaned:
+            cleaned = cleaned.replace(",", ".")
+        elif cleaned.count(".") == 1 and len(cleaned.split(".")[1]) == 3:
+            cleaned = cleaned.replace(".", "")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+    return None
+
+
+def _attribute_items(advert):
+    items = []
+    for field in ("attributes", "params"):
+        value = advert.get(field) if isinstance(advert, dict) else None
+        if isinstance(value, list):
+            items.extend(i for i in value if isinstance(i, dict))
+    return items
+
+
+def _item_ident(item):
+    parts = [item.get(k) for k in ("code", "key", "urn", "name")]
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _item_value(item):
+    value = item.get("value")
+    if value is None and isinstance(item.get("values"), list) and item["values"]:
+        value = item["values"][0]
+    if isinstance(value, list) and value:
+        value = value[0]
+    if isinstance(value, dict):
+        value = value.get("value") if value.get("value") is not None else value.get("key")
+    return value
+
+
+def _group_digits(number):
+    return f"{int(round(number)):,}".replace(",", " ")
+
+
+def extract_price(advert):
+    """Preço do anúncio como texto (ex.: '18 500 €') ou None se não existir."""
+    if not isinstance(advert, dict):
+        return None
+    price = advert.get("price")
+    currency = ""
+    if isinstance(price, dict):
+        value = _to_number(price.get("value"))
+        currency = str(price.get("currency") or "").upper()
+    else:
+        value = _to_number(price)
+
+    # Valores simbólicos (ex.: 1 €) não são preços reais.
+    if value is None or value < 100:
+        value = None
+        for item in _attribute_items(advert):
+            ident = _item_ident(item)
+            if re.search(r"price|preco", ident) and not re.search(r"negoci|trade|troca|unit", ident):
+                candidate = _to_number(_item_value(item))
+                if candidate and candidate >= 100:
+                    value = candidate
+                    break
+    if value is None:
+        return None
+    if currency and currency != "EUR":
+        return f"{_group_digits(value)} {currency}"
+    return f"{_group_digits(value)} €"
+
+
+def extract_mileage(advert):
+    """Quilometragem em km (int) ou None se não existir no anúncio."""
+    if not isinstance(advert, dict):
+        return None
+    for item in _attribute_items(advert):
+        ident = _item_ident(item)
+        if "unit" in ident:
+            continue
+        if re.search(r"mileage|quilomet|kilomet|odometer|(?<![a-z])kms?(?![a-z])", ident):
+            number = _to_number(_item_value(item))
+            if number and 0 < number < 2_000_000:
+                return int(round(number))
+    return None
+
+
+def fetch_advert(advert_id, access_token, refresh_token):
+    """Lê o anúncio (com cache curta). Nunca levanta erro: sem dados devolve {}."""
+    if not advert_id:
+        return {}, access_token, refresh_token
+    key = str(advert_id)
+    cached = _ADVERT_CACHE.get(key)
+    if cached and time.time() - cached[0] < ADVERT_CACHE_SECONDS:
+        return cached[1], access_token, refresh_token
+    try:
+        response, access_token, refresh_token = olx_request(
+            "GET", f"/adverts/{key}", access_token, refresh_token
         )
+        if not response.ok:
+            debug_log(f"anúncio {key}: HTTP {response.status_code} (respostas usam texto genérico do anúncio)")
+            return {}, access_token, refresh_token
+        payload = response.json()
+        advert = payload.get("data", payload) if isinstance(payload, dict) else {}
+        if not isinstance(advert, dict):
+            advert = {}
+    except Exception as exc:
+        debug_log(f"anúncio {key}: erro a ler ({exc})")
+        return {}, access_token, refresh_token
 
-    if any(p in texto for p in [
-        "retoma", "aceitam retoma", "aceita retoma", "troca",
-        "dar o meu carro", "dar a minha viatura",
-    ]):
-        return (
-            f"{saudacao} Sim, podemos avaliar uma possível retoma. "
-            "Envie-nos, por favor, algumas fotografias da viatura, marca, modelo, "
-            "ano, quilometragem e motorização para o WhatsApp 962 148 367 "
-            "e fazemos uma avaliação."
-        )
-
-    if any(p in texto for p in [
-        "financiamento", "financiam", "financiar", "crédito", "credito",
-        "prestações", "prestacoes", "mensalidade",
-    ]):
-        return (
-            f"{saudacao} De momento estamos a atualizar as nossas soluções de "
-            "financiamento, pelo que temporariamente não estamos a realizar novos "
-            "processos. Prevemos voltar a disponibilizar esta opção em breve."
-        )
-
-    if any(p in texto for p in [
-        "onde estão", "onde estao", "onde fica", "localização", "localizacao",
-        "morada", "onde posso ver", "onde ver", "onde têm os carros",
-        "onde tem os carros",
-    ]):
-        return (
-            f"{saudacao} Pode ver a viatura mediante marcação na Ruela da Cavada "
-            "Nova, n.º 74, 4585-053 Baltar, Paredes. Se pretender, podemos combinar "
-            "um dia e horário."
-        )
-
-    if any(p in texto for p in [
-        "garantia", "tem garantia", "quanto tempo de garantia",
-        "quantos meses de garantia",
-    ]):
-        return (
-            f"{saudacao} As condições de garantia dependem da viatura e das "
-            "condições da venda. Quando aplicável, trabalhamos com garantia até "
-            "18 meses. Podemos confirmar as condições específicas desta viatura."
-        )
-
-    if any(p in texto for p in [
-        "posso ir ver", "quero ver", "marcar", "marcação", "marcacao",
-        "visitar", "visita", "test drive", "experimentar", "posso experimentar",
-    ]):
-        return (
-            f"{saudacao} Claro. Podemos combinar uma visita para ver a viatura "
-            "e esclarecer todas as questões. Indique-nos, por favor, o dia e "
-            "horário que lhe dão mais jeito."
-        )
-
-    if any(p in texto for p in [
-        "mais fotos", "mais fotografias", "fotos", "fotografias", "vídeo", "video",
-    ]):
-        return (
-            f"{saudacao} Claro. Podemos enviar mais fotografias ou vídeos da "
-            "viatura. Diga-nos que detalhes pretende ver ou contacte-nos pelo "
-            "WhatsApp 962 148 367."
-        )
-
-    if any(p in texto for p in [
-        "quilómetros", "quilometros", "km", "quantos kms", "quantos km",
-    ]):
-        return (
-            f"{saudacao} A quilometragem encontra-se indicada no anúncio. "
-            "Se tiver alguma questão específica sobre o histórico da viatura, "
-            "podemos esclarecer."
-        )
-
-    if any(p in texto for p in [
-        "histórico", "historico", "revisões", "revisoes", "manutenção",
-        "manutencao", "livro de revisões", "livro de revisoes",
-    ]):
-        return (
-            f"{saudacao} Podemos esclarecer toda a informação disponível sobre "
-            "o histórico e manutenção desta viatura. Diga-nos concretamente o "
-            "que pretende saber."
-        )
-
-    if any(p in texto for p in [
-        "contacto", "telefone", "telemóvel", "telemovel", "whatsapp",
-        "número", "numero",
-    ]):
-        return (
-            f"{saudacao} Pode contactar-nos através do WhatsApp pelo número "
-            "962 148 367. Onde podemos ajudar?"
-        )
-
-    return (
-        f"{saudacao} Obrigado pelo seu contacto com a TC Car Premium. "
-        "Onde podemos ajudar?"
+    _ADVERT_CACHE[key] = (time.time(), advert)
+    debug_log(
+        f"anúncio {key}: campos={sorted(advert.keys())} preco={extract_price(advert)} "
+        f"km={extract_mileage(advert)} "
+        f"atributos={[_item_ident(i) for i in _attribute_items(advert)][:25]}"
     )
+    return advert, access_token, refresh_token
+
+
+# ---------------------------------------------------------------------------
+# Intenções
+# ---------------------------------------------------------------------------
+def normalize_text(text):
+    """Minúsculas, sem acentos e com espaços normalizados."""
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", text.lower()).strip()
+
+
+INTENT_PATTERNS = {
+    "disponibilidade": re.compile(
+        r"disponivel|disponibilidade|ainda esta a venda|ainda a venda|ainda existe"
+        r"|ainda (?:tem|tens|existe) (?:o|a|esse|essa) (?:carro|viatura|anuncio|automovel|veiculo)"
+        r"|ja (?:foi )?vendid[oa]|ja vendeu|ja vendeste|ja venderam|esta vendid[oa]|foi vendid[oa]"
+    ),
+    "negociacao": re.compile(
+        r"negociavel|negociar|faz(?:em)? desconto|desconto|baixa(?:m)? (?:o )?preco"
+        r"|melhor preco|preco minimo|ultimo preco|valor minimo|ultimo valor|\bminimo\b|margem"
+    ),
+    "preco": re.compile(
+        r"preco|valor|quanto (?:e|fica|custa|pedem|pede|querem|quer|levam|leva)|custa|custo|por quanto"
+    ),
+    "retoma": re.compile(
+        r"retoma"
+        r"|\btroca\b(?!\s+de\s+(?:oleo|correia|distribuicao|pneus|pastilhas|travoes|embraiagem|filtros))"
+        r"|\btrocar\b|dar o meu|dar a minha|entregar o meu|entregar a minha"
+    ),
+    "financiamento": re.compile(
+        r"financiamento|financiam\w*|financiar|credito|prestac\w*|mensalidades?"
+    ),
+    "localizacao": re.compile(
+        r"onde (?:estao|fica|ficam|sao|se encontra|se situa|vendem|moram)"
+        r"|onde esta (?:o|a) (?:carro|viatura|veiculo)|localizacao|localidade|morada"
+        r"|onde posso ver|onde (?:e )?ver|onde tem (?:os )?carros|onde tem o carro"
+        r"|em que (?:zona|cidade|localidade|concelho)|de onde (?:e|sao|esta|estao)|\bstand\b"
+    ),
+    "garantia": re.compile(r"garantia"),
+    "visita": re.compile(
+        r"posso ir ver|ir ver (?:o|a)|ver (?:o|a) (?:carro|viatura|veiculo|automovel)"
+        r"|ver pessoalmente|quero ver(?! (?:mais )?(?:fot|imag|video))"
+        r"|marcar|marcacao|agendar|visitar|visita|test[- ]?drive|teste de conducao"
+        r"|experimentar|conduzir|passar por ai|passar ai|ir ai"
+    ),
+    "fotos": re.compile(r"\bfotos?\b|fotografias?|imagens|\bvideos?\b"),
+    "km": re.compile(r"(?<![a-z])kms?\b|quilomet\w*|kilomet\w*"),
+    "historico": re.compile(
+        r"historico|revisoes|revisao|manutencao|livro de revisoes|correia|distribuicao|oleo"
+        r"|\bdonos?\b|primeiro dono|segundo dono|unico dono|acidente|sinistro"
+    ),
+    "contacto": re.compile(
+        r"contacto|contato|telefone|telemovel|whatsapp|whats app|\bzap\b|\bligar\b|\bligo\b"
+        r"|numero(?: de)? (?:telefone|telemovel|contacto|whatsapp|zap)"
+        r"|(?:vosso|seu|teu|o|um) numero\b(?!\s+d)"
+    ),
+}
+
+# Perguntas explícitas sobre o preço do carro (não confundir com retoma/mensalidade).
+PRICE_EXPLICIT = re.compile(
+    r"quanto (?:custa|pedem|pede|querem|quer)|por quanto"
+    r"|qual (?:e )?o (?:preco|valor)(?!\s+(?:da|de|das|do)\s+(?:retoma|entrada|troca|prestac\w*|mensalidade))"
+    r"|(?:preco|valor) (?:do|da) (?:carro|veiculo|viatura|anuncio)"
+)
+VISIT_STRONG = re.compile(r"marcar|marcacao|agendar|test[- ]?drive|teste de conducao|experimentar|conduzir")
+
+MAX_INTENTS_PER_REPLY = 3
+
+
+def detect_intents(text):
+    """Intenções reconhecidas, pela ordem em que aparecem na mensagem."""
+    t = normalize_text(text)
+    found = {}
+    for name, pattern in INTENT_PATTERNS.items():
+        match = pattern.search(t)
+        if match:
+            found[name] = match.start()
+
+    # "preço" solto, junto de negociação/retoma/financiamento, não é pergunta de preço.
+    if "preco" in found and not PRICE_EXPLICIT.search(t):
+        if any(k in found for k in ("negociacao", "retoma", "financiamento")):
+            del found["preco"]
+    # "Onde posso ver o carro?" é localização, não pedido de marcação.
+    if "visita" in found and "localizacao" in found and not VISIT_STRONG.search(t):
+        del found["visita"]
+
+    return sorted(found, key=lambda name: found[name])[:MAX_INTENTS_PER_REPLY]
+
+
+HELP_CLOSING = "Onde podemos ajudar?"
+VISIT_CLOSING = "Se pretender, podemos combinar uma visita para a ver."
+
+# (corpo, fecho). O fecho só é usado quando há uma única intenção.
+STATIC_REPLIES = {
+    "disponibilidade": ("Sim, a viatura continua disponível.", HELP_CLOSING),
+    "negociacao": (
+        "Existe alguma margem para negociação, mas preferimos falar sobre valores "
+        "depois de ver a viatura.",
+        HELP_CLOSING,
+    ),
+    "retoma": (
+        "Sim, podemos avaliar uma possível retoma. Envie-nos, por favor, algumas "
+        "fotografias da viatura, marca, modelo, ano, quilometragem e motorização "
+        "para o WhatsApp 962 148 367 e fazemos uma avaliação.",
+        "",
+    ),
+    "financiamento": (
+        "De momento estamos a atualizar as nossas soluções de financiamento, pelo "
+        "que temporariamente não estamos a realizar novos processos. Prevemos voltar "
+        "a disponibilizar esta opção em breve.",
+        "",
+    ),
+    "localizacao": (
+        "Pode ver a viatura mediante marcação na Ruela da Cavada Nova, n.º 74, "
+        "4585-053 Baltar, Paredes. Se pretender, podemos combinar um dia e horário.",
+        "",
+    ),
+    "garantia": (
+        "As condições de garantia dependem da viatura e das condições da venda. "
+        "Quando aplicável, trabalhamos com garantia até 18 meses. Podemos confirmar "
+        "as condições específicas desta viatura.",
+        "",
+    ),
+    "visita": (
+        "Claro. Podemos combinar uma visita para ver a viatura e esclarecer todas "
+        "as questões. Indique-nos, por favor, o dia e horário que lhe dão mais jeito.",
+        "",
+    ),
+    "fotos": (
+        "Claro. Podemos enviar mais fotografias ou vídeos da viatura. Diga-nos que "
+        "detalhes pretende ver ou contacte-nos pelo WhatsApp 962 148 367.",
+        "",
+    ),
+    "historico": (
+        "Podemos esclarecer toda a informação disponível sobre o histórico e "
+        "manutenção desta viatura. Diga-nos concretamente o que pretende saber.",
+        "",
+    ),
+    "contacto": ("Pode contactar-nos através do WhatsApp pelo número 962 148 367.", HELP_CLOSING),
+}
+
+
+def _intent_text(name, advert):
+    if name == "preco":
+        price = extract_price(advert)
+        if price:
+            return f"O valor da viatura é {price}.", VISIT_CLOSING
+        return "O valor da viatura está indicado no anúncio.", VISIT_CLOSING
+    if name == "km":
+        km = extract_mileage(advert)
+        if km:
+            return (
+                f"A viatura tem {_group_digits(km)} km.",
+                "Se tiver alguma questão sobre o histórico da viatura, podemos esclarecer.",
+            )
+        return (
+            "A quilometragem encontra-se indicada no anúncio. Se tiver alguma questão "
+            "específica sobre o histórico da viatura, podemos esclarecer.",
+            "",
+        )
+    return STATIC_REPLIES[name]
+
+
+def compose_reply(intents, advert=None):
+    saudacao = greeting()
+    if not intents:
+        return f"{saudacao} Obrigado pelo seu contacto com a TC Car Premium. Onde podemos ajudar?"
+    parts = [_intent_text(name, advert or {}) for name in intents]
+    if len(parts) == 1:
+        body, closing = parts[0]
+        return " ".join(x for x in (saudacao, body, closing) if x)
+    return " ".join([saudacao] + [body for body, _ in parts])
+
+
+def build_reply(text, advert=None):
+    return compose_reply(detect_intents(text), advert)
 
 
 def debug_log(*parts):
@@ -445,14 +680,62 @@ def mark_thread_read(thread_uuid, access_token, refresh_token):
     return response, access_token, refresh_token
 
 
-def initialize_without_replying(access_token, refresh_token):
+def get_account_id(access_token, refresh_token):
+    """Identifica a conta do token (só leitura). Sem id, nada é enviado."""
+    response, access_token, refresh_token = olx_request(
+        "GET", "/users/me", access_token, refresh_token
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"Não foi possível identificar a conta OLX (HTTP {response.status_code})."
+        )
+    payload = response.json()
+    me = payload.get("data", payload) if isinstance(payload, dict) else {}
+    account_id = me.get("id") if isinstance(me, dict) else None
+    if account_id is None:
+        raise RuntimeError("A resposta de /users/me não trouxe o id da conta.")
+    return str(account_id), access_token, refresh_token
+
+
+def baseline_key(account_id):
+    return f"{BASELINE_PREFIX}{account_id}"
+
+
+def get_baseline(account_id):
+    """Marco da conta: o created_at mais recente que já existia na inicialização."""
+    result = (
+        supabase.table("olx_mensagens_processadas")
+        .select("message_id,thread_uuid")
+        .eq("message_id", baseline_key(account_id))
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        return None
+    return {"cutoff_text": result.data[0].get("thread_uuid") or "NONE"}
+
+
+def save_baseline(account_id, cutoff_text):
+    supabase.table("olx_mensagens_processadas").insert(
+        {
+            "message_id": baseline_key(account_id),
+            "thread_uuid": cutoff_text or "NONE",  # guarda aqui o created_at de corte
+            "advert_id": "SYSTEM",
+        }
+    ).execute()
+
+
+def initialize_without_replying(account_id, access_token, refresh_token):
     """
-    Primeira execução:
-    regista TODAS as mensagens recebidas que já existem como processadas.
-    Assim as mais de 100 mensagens antigas nunca recebem resposta automática.
+    Inicialização POR CONTA. Nunca envia nada:
+      1. marca como processadas todas as mensagens recebidas que já existem;
+      2. guarda o created_at mais recente visto (o 'corte').
+    Só depois de tudo lido é que o marco é gravado; se falhar a meio, não fica
+    marco e o bot continua sem responder até a inicialização terminar.
     """
     threads, access_token, refresh_token = get_threads(access_token, refresh_token)
     marked = 0
+    newest_dt, newest_text = None, None
 
     for thread in threads:
         thread_uuid = thread.get("uuid") or thread.get("id")
@@ -463,8 +746,11 @@ def initialize_without_replying(access_token, refresh_token):
         messages, access_token, refresh_token = get_messages(
             thread_uuid, access_token, refresh_token
         )
-
         for message in messages:
+            ts = parse_ts(message.get("created_at"))
+            if ts is not None and (newest_dt is None or ts > newest_dt):
+                newest_dt, newest_text = ts, str(message.get("created_at"))
+
             if message.get("type") != "received":
                 continue
             mid = message_key(message)
@@ -472,12 +758,18 @@ def initialize_without_replying(access_token, refresh_token):
                 mark_processed(mid, thread_uuid, advert_id)
                 marked += 1
 
+    save_baseline(account_id, newest_text or "NONE")
     mark_processed(INITIALIZED_SENTINEL, "SYSTEM", "SYSTEM")
-
+    print(
+        f"[BOT] Inicialização da conta concluída: {marked} mensagens antigas ignoradas, "
+        f"corte={newest_text or 'NONE'}, threads={len(threads)}",
+        flush=True,
+    )
     return {
         "estado": "inicializado",
         "mensagens_antigas_ignoradas": marked,
         "threads_verificadas": len(threads),
+        "corte": newest_text or "NONE",
     }
 
 
@@ -490,9 +782,12 @@ def process_new_messages():
         if not access_token:
             return {"erro": "Não existe nenhum token OLX guardado."}
 
-        # Segurança principal: na primeira execução nunca responde ao histórico.
-        if not is_processed(INITIALIZED_SENTINEL):
-            return initialize_without_replying(access_token, refresh_token)
+        # Segurança principal: cada conta tem de ser inicializada antes de responder.
+        account_id, access_token, refresh_token = get_account_id(access_token, refresh_token)
+        baseline = get_baseline(account_id)
+        if baseline is None:
+            return initialize_without_replying(account_id, access_token, refresh_token)
+        cutoff = parse_ts(baseline["cutoff_text"])
 
         threads, access_token, refresh_token = get_threads(access_token, refresh_token)
         replies_sent = 0
@@ -505,6 +800,9 @@ def process_new_messages():
             f"ids={[item_key(t) for t in threads][:20]}",
             flush=True,
         )
+
+        # 1.ª fase: só LER e decidir. Nada é enviado aqui.
+        jobs = []
         for thread in threads:
             thread_uuid = thread.get("uuid") or thread.get("id")
             advert_id = thread.get("advert_id")
@@ -527,6 +825,8 @@ def process_new_messages():
                 "enviadas": 0,
                 "outros_tipos": {},
                 "sem_id": 0,
+                "sem_data": 0,
+                "anteriores_ao_marco": 0,
                 "ja_processadas": 0,
             }
             for message in messages:
@@ -540,25 +840,73 @@ def process_new_messages():
                     stats["outros_tipos"][key] = stats["outros_tipos"].get(key, 0) + 1
                 if mtype != "received":
                     continue
+
                 mid = message_key(message)
                 if not mid:
                     stats["sem_id"] += 1
                     continue
-                if is_processed(mid):
+
+                # Regra de ouro: o que já existia na inicialização nunca é "novo",
+                # esteja ou não marcado como não lido.
+                if cutoff is not None:
+                    ts = parse_ts(message.get("created_at"))
+                    if ts is None:
+                        stats["sem_data"] += 1
+                        continue
+                    if ts <= cutoff:
+                        stats["anteriores_ao_marco"] += 1
+                        continue
+
+                if mid in _REPLIED_IDS or is_processed(mid):
                     stats["ja_processadas"] += 1
-                else:
-                    pending.append(message)
+                    continue
+                pending.append(message)
+
             stats["pendentes"] = len(pending)
-            thread_debug.append({"thread": str(thread_uuid), "unread_count": thread.get("unread_count"), **stats})
+            entry = {
+                "thread": str(thread_uuid),
+                "unread_count": thread.get("unread_count"),
+                **stats,
+            }
+            thread_debug.append(entry)
             debug_thread(thread, messages, stats, pending)
 
-            if not pending:
-                continue
+            if pending:
+                jobs.append((thread_uuid, advert_id, pending, entry))
 
-            # Se o cliente enviar várias mensagens seguidas, damos UMA resposta,
-            # usando o conjunto das mensagens, em vez de bombardear o cliente.
+        # Travão de segurança: muitas conversas "novas" ao mesmo tempo não é normal.
+        if len(jobs) > MAX_REPLIES_PER_RUN:
+            for thread_uuid, advert_id, pending, _entry in jobs:
+                for message in pending:
+                    mark_processed(message_key(message), thread_uuid, advert_id)
+                    messages_marked += 1
+            print(
+                f"[BOT] TRAVÃO: {len(jobs)} conversas pendentes (máx. {MAX_REPLIES_PER_RUN}). "
+                "Nada foi enviado; as mensagens foram marcadas como processadas.",
+                flush=True,
+            )
+            return {
+                "estado": "travao_seguranca",
+                "conversas_pendentes": len(jobs),
+                "limite": MAX_REPLIES_PER_RUN,
+                "respostas_enviadas": 0,
+                "mensagens_processadas": messages_marked,
+                "threads_verificadas": len(threads),
+            }
+
+        # 2.ª fase: responder. Várias mensagens seguidas => UMA resposta.
+        for thread_uuid, advert_id, pending, entry in jobs:
             combined_text = " ".join((m.get("text") or "") for m in pending).strip()
-            reply = build_reply(combined_text)
+            intents = detect_intents(combined_text)
+            entry["intencoes"] = intents or ["generica"]
+
+            advert = {}
+            if "preco" in intents or "km" in intents:
+                advert, access_token, refresh_token = fetch_advert(
+                    advert_id, access_token, refresh_token
+                )
+            reply = compose_reply(intents, advert)
+            debug_log(f"thread={thread_uuid} intencoes={entry['intencoes']}")
 
             send_response, access_token, refresh_token = send_message(
                 thread_uuid,
@@ -577,8 +925,12 @@ def process_new_messages():
             # Só marcamos como processadas DEPOIS de o OLX confirmar o envio.
             for message in pending:
                 mid = message_key(message)
-                mark_processed(mid, thread_uuid, advert_id)
-                messages_marked += 1
+                _REPLIED_IDS.add(mid)  # evita repetir mesmo que a base de dados falhe
+                try:
+                    mark_processed(mid, thread_uuid, advert_id)
+                    messages_marked += 1
+                except Exception as exc:
+                    errors.append(f"{thread_uuid}: resposta enviada mas não ficou registada ({exc})")
 
             replies_sent += 1
 
@@ -780,6 +1132,28 @@ def olx_diagnostico():
         ]
         out["anuncios"] = info
 
+        detalhes = []
+        for a in adverts[:5]:
+            aid = a.get("id")
+            info_a, payload_a, access_token, refresh_token = _probe(
+                f"/adverts/{aid}", access_token, refresh_token
+            )
+            adv = payload_a.get("data", payload_a) if isinstance(payload_a, dict) else {}
+            if not isinstance(adv, dict):
+                adv = {}
+            detalhes.append(
+                {
+                    "advert_id": aid,
+                    "http": info_a["http"],
+                    "campos": sorted(adv.keys()),
+                    "price_bruto": adv.get("price"),
+                    "preco_que_o_bot_usa": extract_price(adv),
+                    "km_que_o_bot_usa": extract_mileage(adv),
+                    "atributos": [_item_ident(i) for i in _attribute_items(adv)][:40],
+                }
+            )
+        out["anuncios_detalhe_para_respostas"] = detalhes
+
         # 3) /threads em 3 variantes, para detetar filtragem no servidor
         variantes = {
             "sem_parametros": None,
@@ -837,17 +1211,23 @@ def olx_diagnostico():
 
 @app.route("/olx/estado")
 def olx_estado():
-    initialized = is_processed(INITIALIZED_SENTINEL)
-    access_token, _ = get_latest_tokens()
-    return jsonify(
-        {
-            "servidor": "online",
-            "conta_olx_ligada": bool(access_token),
-            "historico_inicial_ignorado": initialized,
-            "auto_poll": AUTO_POLL,
-            "intervalo_segundos": POLL_SECONDS,
-        }
-    )
+    access_token, refresh_token = get_latest_tokens()
+    info = {
+        "servidor": "online",
+        "conta_olx_ligada": bool(access_token),
+        "historico_inicial_ignorado": False,
+        "auto_poll": AUTO_POLL,
+        "intervalo_segundos": POLL_SECONDS,
+    }
+    if access_token:
+        try:
+            account_id, access_token, refresh_token = get_account_id(access_token, refresh_token)
+            baseline = get_baseline(account_id)
+            info["historico_inicial_ignorado"] = baseline is not None
+            info["marco_created_at"] = baseline["cutoff_text"] if baseline else None
+        except Exception as exc:
+            info["erro"] = str(exc)
+    return jsonify(info)
 
 
 # Inicia o ciclo automático apenas uma vez por processo.
