@@ -43,6 +43,11 @@ BASELINE_PREFIX = "__TC_CAR_PREMIUM_BASELINE__|"
 MAX_REPLIES_PER_RUN = max(1, int(os.environ.get("MAX_REPLIES_PER_RUN", "10")))
 ADVERT_CACHE_SECONDS = 600
 _REPLIED_IDS = set()
+# Só relê as mensagens de uma conversa se ela mudou (total_count) ou tem não lidas.
+# De FULL_SCAN_EVERY em FULL_SCAN_EVERY ciclos relê tudo, como rede de segurança.
+FULL_SCAN_EVERY = max(1, int(os.environ.get("FULL_SCAN_EVERY", "20")))
+_THREAD_SEEN = {}
+_CYCLE_COUNT = 0
 process_lock = threading.Lock()
 
 
@@ -773,7 +778,8 @@ def initialize_without_replying(account_id, access_token, refresh_token):
     }
 
 
-def process_new_messages():
+def process_new_messages(force_full=False):
+    global _CYCLE_COUNT
     if not process_lock.acquire(blocking=False):
         return {"estado": "já existe um processamento em curso"}
 
@@ -789,6 +795,9 @@ def process_new_messages():
             return initialize_without_replying(account_id, access_token, refresh_token)
         cutoff = parse_ts(baseline["cutoff_text"])
 
+        _CYCLE_COUNT += 1
+        full_scan = force_full or _CYCLE_COUNT % FULL_SCAN_EVERY == 1 % FULL_SCAN_EVERY
+        skipped = 0
         threads, access_token, refresh_token = get_threads(access_token, refresh_token)
         replies_sent = 0
         messages_marked = 0
@@ -810,6 +819,18 @@ def process_new_messages():
             if not thread_uuid:
                 continue
 
+            total = thread.get("total_count")
+            unread = int(thread.get("unread_count") or 0)
+            last_total = _THREAD_SEEN.get(str(thread_uuid))
+            if (
+                not full_scan
+                and total is not None
+                and last_total == total
+                and unread == 0
+            ):
+                skipped += 1
+                continue
+
             try:
                 messages, access_token, refresh_token = get_messages(
                     thread_uuid, access_token, refresh_token
@@ -817,6 +838,8 @@ def process_new_messages():
             except Exception as exc:
                 errors.append(f"{thread_uuid}: {exc}")
                 continue
+            if total is not None:
+                _THREAD_SEEN[str(thread_uuid)] = total
 
             pending = []
             stats = {
@@ -916,6 +939,7 @@ def process_new_messages():
             )
 
             if not send_response.ok:
+                _THREAD_SEEN.pop(str(thread_uuid), None)  # voltar a ler no ciclo seguinte
                 errors.append(
                     f"{thread_uuid}: falha ao responder HTTP "
                     f"{send_response.status_code} - {send_response.text[:200]}"
@@ -943,6 +967,8 @@ def process_new_messages():
         return {
             "estado": "ok",
             "threads_verificadas": len(threads),
+            "threads_sem_alteracoes": skipped,
+            "leitura_completa": full_scan,
             "mensagens_nao_lidas_api": unread_total,
             "respostas_enviadas": replies_sent,
             "mensagens_processadas": messages_marked,
@@ -960,11 +986,15 @@ def polling_loop():
     # Pequeno atraso para o servidor arrancar antes da primeira consulta.
     time.sleep(10)
     while True:
+        started = time.monotonic()
         try:
             process_new_messages()
         except Exception as exc:
             print(f"[BOT] Erro no ciclo automático: {exc}", flush=True)
-        time.sleep(POLL_SECONDS)
+        elapsed = time.monotonic() - started
+        if OLX_DEBUG or elapsed > POLL_SECONDS:
+            print(f"[BOT] ciclo concluído em {elapsed:.1f}s (intervalo alvo {POLL_SECONDS}s)", flush=True)
+        time.sleep(max(1.0, POLL_SECONDS - elapsed))
 
 
 @app.route("/")
@@ -1057,7 +1087,7 @@ def olx_callback():
 @app.route("/olx/processar")
 def olx_processar():
     # Rota útil para teste e também para um monitor externo chamar periodicamente.
-    return jsonify(process_new_messages())
+    return jsonify(process_new_messages(force_full=True))
 
 
 def _mask(value):
