@@ -33,7 +33,7 @@ OLX_AUTHORIZE_URL = "https://www.olx.pt/oauth/authorize/"
 OLX_TOKEN_URL = "https://www.olx.pt/api/open/oauth/token"
 OLX_API_BASE = "https://www.olx.pt/api/partner"
 
-POLL_SECONDS = max(30, int(os.environ.get("POLL_SECONDS", "60")))
+POLL_SECONDS = max(10, int(os.environ.get("POLL_SECONDS", "15")))
 AUTO_POLL = os.environ.get("AUTO_POLL", "true").lower() in {"1", "true", "yes", "sim"}
 
 OLX_DEBUG = os.environ.get("OLX_DEBUG", "true").lower() in {"1", "true", "yes", "sim"}
