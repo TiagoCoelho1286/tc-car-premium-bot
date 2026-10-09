@@ -239,9 +239,17 @@ def parse_ts(value):
 
 
 # ---------------------------------------------------------------------------
-# Dados do anúncio (preço e quilometragem)
+# Dados do anúncio
+#
+# Arquitetura: o anúncio inteiro é convertido numa lista de "factos"
+# (nome + valor). Cada pergunta do cliente corresponde a um TEMA (km, ano,
+# combustível...) e cada tema sabe que nomes de campo procurar nesses factos.
+# Para responder a uma pergunta nova basta acrescentar uma linha em
+# TOPIC_FIELDS (nomes do campo) e em INTENT_PATTERNS (como o cliente pergunta).
 # ---------------------------------------------------------------------------
 _ADVERT_CACHE = {}
+_ADVERT_LIST_CACHE = {"ts": 0.0, "by_id": {}}
+ADVERT_LIST_CACHE_SECONDS = 120
 
 
 def _to_number(value):
@@ -255,9 +263,13 @@ def _to_number(value):
             return None
         if "," in cleaned and "." in cleaned:
             cleaned = cleaned.replace(".", "").replace(",", ".")
+        elif re.fullmatch(r"\d{1,3}(?:,\d{3})+", cleaned):
+            cleaned = cleaned.replace(",", "")
         elif "," in cleaned:
             cleaned = cleaned.replace(",", ".")
         elif cleaned.count(".") == 1 and len(cleaned.split(".")[1]) == 3:
+            cleaned = cleaned.replace(".", "")
+        elif cleaned.count(".") > 1:
             cleaned = cleaned.replace(".", "")
         try:
             return float(cleaned)
@@ -292,11 +304,12 @@ def _item_value(item):
 
 
 def _group_digits(number):
-    return f"{int(round(number)):,}".replace(",", " ")
+    """Milhares com ponto, como em Portugal: 154500 -> '154.500'."""
+    return f"{int(round(number)):,}".replace(",", ".")
 
 
 def extract_price(advert):
-    """Preço do anúncio como texto (ex.: '18 500 €') ou None se não existir."""
+    """Preço do anúncio como texto (ex.: '18.500 €') ou None se não existir."""
     if not isinstance(advert, dict):
         return None
     price = advert.get("price")
@@ -324,19 +337,406 @@ def extract_price(advert):
     return f"{_group_digits(value)} €"
 
 
-def extract_mileage(advert):
-    """Quilometragem em km (int) ou None se não existir no anúncio."""
-    if not isinstance(advert, dict):
+# ---- 1) anúncio -> factos ---------------------------------------------------
+_SKIP_KEYS = {
+    "contact", "phone", "email", "user", "images", "photos", "courier",
+    "external_url", "external_id", "url", "map", "salary", "delivery",
+}
+_EMPTY_VALUES = {"", "none", "null", "nan", "-", "n/a", "na", "undefined"}
+_MAX_FACT_VALUE = 300
+
+
+def _norm_ident(*parts):
+    text = " ".join(str(p) for p in parts if p not in (None, ""))
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c)).lower()
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _value_text(value):
+    """Valor legível: aceita texto, número, bool, listas e {label/name/value...}."""
+    if value is None:
         return None
-    for item in _attribute_items(advert):
-        ident = _item_ident(item)
-        if "unit" in ident:
-            continue
-        if re.search(r"mileage|quilomet|kilomet|odometer|(?<![a-z])kms?(?![a-z])", ident):
-            number = _to_number(_item_value(item))
-            if number and 0 < number < 2_000_000:
-                return int(round(number))
+    if isinstance(value, bool):
+        return "sim" if value else "não"
+    if isinstance(value, (int, float)):
+        return str(int(value)) if float(value).is_integer() else str(value)
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("label", "name", "title", "value", "key", "code"):
+            if key in value:
+                text = _value_text(value[key])
+                if text:
+                    return text
+        return None
+    if isinstance(value, list):
+        parts = [t for t in (_value_text(v) for v in value) if t]
+        return ", ".join(parts) if parts else None
     return None
+
+
+_DESC_LINE = re.compile(r"^\s*(?:[-•*·▪►✔✅]\s*)?([^\W\d_][\w ./ºª()\-]{1,30}?)\s*:\s*(.{1,80}?)\s*$")
+
+
+def _description_lines(description):
+    text = str(description or "")
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</div>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return text.splitlines()[:150]
+
+
+def extract_facts(advert):
+    """Todos os dados do anúncio como lista de factos {ident, label, value, source}."""
+    facts = []
+    if not isinstance(advert, dict):
+        return facts
+
+    def add(ident, label, value, source):
+        text = _value_text(value)
+        if text is None or text.lower() in _EMPTY_VALUES:
+            return
+        facts.append(
+            {"ident": ident, "label": label or "", "value": text[:_MAX_FACT_VALUE], "source": source}
+        )
+
+    # Atributos estruturados (matrícula, km, combustível...)
+    for item in _attribute_items(advert):
+        value = item.get("value")
+        if value in (None, "", []):
+            value = item.get("values")
+        label = _value_text(item.get("label") or item.get("name") or item.get("title"))
+        code = _norm_ident(
+            item.get("code"), item.get("key"), item.get("urn"), item.get("slug"),
+            item.get("id") if isinstance(item.get("id"), str) else None,
+        )
+        add(_norm_ident(code, label), label, value, "atributo")
+
+    # Restantes campos do anúncio (preço, localização, título...)
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if str(key).lower() in _SKIP_KEYS or key in ("attributes", "params"):
+                    continue
+                walk(val, path + [str(key)])
+        elif isinstance(node, list):
+            if node and all(not isinstance(x, (dict, list)) for x in node):
+                add(_norm_ident(*path), "", node, "campo")
+            else:
+                for x in node:
+                    walk(x, path)
+        else:
+            add(_norm_ident(*path), "", node, "campo")
+
+    walk(advert, [])
+
+    # Linhas "Etiqueta: valor" escritas na descrição (ex.: "Km: 154.500")
+    count = 0
+    for line in _description_lines(advert.get("description")):
+        match = _DESC_LINE.match(line)
+        if not match:
+            continue
+        label, value = match.group(1).strip(), match.group(2).strip()
+        add(_norm_ident(label), label, value, "descricao")
+        count += 1
+        if count >= 60:
+            break
+    return facts
+
+
+_SOURCE_ORDER = ("atributo", "campo", "descricao")
+
+
+def find_facts(facts, include, exclude=None):
+    """Todos os factos cujo nome corresponde a 'include' (atributos primeiro)."""
+    inc = re.compile(include)
+    exc = re.compile(exclude) if exclude else None
+    out = []
+    for source in _SOURCE_ORDER:
+        for fact in facts:
+            if fact["source"] != source:
+                continue
+            if inc.search(fact["ident"]) and not (exc and exc.search(fact["ident"])):
+                out.append(fact)
+    return out
+
+
+def find_fact(facts, include, exclude=None):
+    """Primeiro facto cujo nome corresponde a 'include' (atributos primeiro)."""
+    found = find_facts(facts, include, exclude)
+    return found[0] if found else None
+
+
+# ---- 2) temas: que campos procurar ------------------------------------------
+_DEFAULT_EXCLUDE = r"\b(?:unit|units|unidade|range)\b"
+TOPIC_EXCLUDE = {
+    "cilindrada": _DEFAULT_EXCLUDE + r"|\b(?:battery|bateria|tank|deposito|trunk|mala|bagageira|load|carga)\b",
+    "potencia": _DEFAULT_EXCLUDE + r"|\b(?:steering|direcao|windows?|vidros|mirrors?|espelhos|seats?|bancos)\b",
+    "combustivel": _DEFAULT_EXCLUDE + r"|\b(?:consum\w*|consumption|emission\w*|emissoes|tank|deposito|capacity)\b",
+    "modelo": _DEFAULT_EXCLUDE + r"|\b(?:year|ano|version|versao)\b",
+}
+
+TOPIC_FIELDS = {
+    "km": r"\b(?:mileage|milage|milleage|kilomet\w*|odometer|quilomet\w*|quilometragem|kms?)\b",
+    "ano": r"\b(?:year|ano|anos? de fabrico|first registration|registration year|registo|matricula)\b",
+    "cilindrada": r"\b(?:enginesize|engine size|engine capacity|capacity|cilindrada|displacement|cubic capacity|cc|cm3)\b",
+    "potencia": r"\b(?:enginepower|engine power|power|potencia|horsepower|hp|bhp|cv|kw|cavalos)\b",
+    "combustivel": r"\b(?:petrol|fuel|fueltype|fuel type|combustivel|carburante)\b",
+    "caixa": r"\b(?:gearbox|transmission|caixa|cambio|caixa de velocidades)\b",
+    "donos": r"\b(?:owners?|donos?|proprietarios?|number of owners|numero de donos)\b",
+    "cor": r"\b(?:colou?r|cor|cores)\b",
+    "portas": r"\b(?:doors?|portas?|number of doors|numero de portas)\b",
+    "lugares": r"\b(?:seats?|lugares|assentos|number of seats|numero de lugares)\b",
+    "carroceria": r"\b(?:car body|carbody|body type|bodytype|body|carroceria|segmento)\b",
+    "marca": r"\b(?:make|brand|marca|manufacturer)\b",
+    "modelo": r"\b(?:model|modelo)\b",
+    "garantia": r"\b(?:warranty|garantia|guarantee)\b",
+}
+
+# Um tema "dado" tem sempre resposta concreta quando o campo existe.
+DATA_TOPICS = (
+    "preco", "km", "ano", "motor", "cilindrada", "potencia", "combustivel",
+    "caixa", "donos", "cor", "portas", "lugares", "carroceria", "modelo", "garantia",
+)
+
+TOPIC_NOUN = {
+    "preco": "o preço",
+    "km": "a quilometragem",
+    "ano": "o ano",
+    "motor": "os dados do motor",
+    "cilindrada": "a cilindrada",
+    "potencia": "a potência",
+    "combustivel": "o combustível",
+    "caixa": "o tipo de caixa",
+    "donos": "o número de donos",
+    "cor": "a cor",
+    "portas": "o número de portas",
+    "lugares": "o número de lugares",
+    "carroceria": "o tipo de carroçaria",
+    "modelo": "a marca e o modelo",
+}
+
+_FUEL_MAP = {
+    "diesel": "diesel", "gasoleo": "diesel", "petrol": "gasolina", "gasoline": "gasolina",
+    "gasolina": "gasolina", "lpg": "GPL", "gpl": "GPL", "cng": "GNC", "gnc": "GNC",
+    "hybrid": "híbrido", "hibrido": "híbrido", "electric": "elétrico",
+    "eletrico": "elétrico", "electrico": "elétrico", "ethanol": "etanol",
+}
+_GEARBOX_MAP = {
+    "manual": "manual", "automatic": "automática", "automatica": "automática",
+    "automatico": "automática", "semi automatic": "semiautomática",
+    "semiautomatica": "semiautomática", "semi automatica": "semiautomática",
+}
+_YES = {"sim", "yes", "true", "1", "y", "s"}
+_NO = {"nao", "no", "false", "0", "n"}
+
+
+def _mapped(value, mapping):
+    key = normalize_text(value).replace("-", " ")
+    return mapping.get(key, value.strip().lower())
+
+
+def _fact_value(facts, topic):
+    fact = find_fact(facts, TOPIC_FIELDS[topic], TOPIC_EXCLUDE.get(topic, _DEFAULT_EXCLUDE))
+    return (fact["value"] if fact else None), fact
+
+
+def _title(advert):
+    return str(advert.get("title") or "") if isinstance(advert, dict) else ""
+
+
+def _km_value(facts, advert):
+    value, _ = _fact_value(facts, "km")
+    number = _to_number(value) if value is not None else None
+    if number is None:
+        m = re.search(r"(?<![\w.])(\d{1,3}(?:[. ]\d{3})+|\d{4,7})\s?km\b", _title(advert), re.I)
+        number = _to_number(m.group(1)) if m else None
+    if number is None or not (0 <= number < 2_000_000):
+        return None
+    return number
+
+
+def _year_value(facts):
+    # Percorre todos os candidatos: 'matrícula' pode ser a chapa e não o ano.
+    for fact in find_facts(facts, TOPIC_FIELDS["ano"], _DEFAULT_EXCLUDE):
+        m = re.search(r"(?<!\d)(19[5-9]\d|20[0-4]\d)(?!\d)", fact["value"])
+        if m:
+            return m.group(1)
+    return None
+
+
+def _cilindrada_text(facts):
+    value, _ = _fact_value(facts, "cilindrada")
+    number = _to_number(value) if value is not None else None
+    if not number or number <= 0:
+        return None
+    if number < 20:
+        return f"{number:.1f} L"
+    return f"{_group_digits(number)} cm³"
+
+
+def _potencia_text(facts, advert):
+    value, fact = _fact_value(facts, "potencia")
+    number = _to_number(value) if value is not None else None
+    unit = "kW" if fact and re.search(r"\bkw\b", fact["ident"] + " " + normalize_text(value or "")) else "cv"
+    if number is None:
+        m = re.search(r"(?<!\d)(\d{2,3})\s?cv\b", _title(advert), re.I)
+        number = float(m.group(1)) if m else None
+        unit = "cv"
+    if not number or number <= 0 or number > 2000:
+        return None
+    return f"{int(round(number))} {unit}"
+
+
+def _fuel_text(facts):
+    value, _ = _fact_value(facts, "combustivel")
+    return _mapped(value, _FUEL_MAP) if value else None
+
+
+def _gearbox_text(facts):
+    value, _ = _fact_value(facts, "caixa")
+    return _mapped(value, _GEARBOX_MAP) if value else None
+
+
+def _fact_sentence(topic, facts, advert, text=""):
+    """Frase com o VALOR CONCRETO do anúncio, ou None se o dado não existir."""
+    qn = normalize_text(text)
+
+    if topic == "preco":
+        price = extract_price(advert)
+        return f"O valor da viatura é {price}." if price else None
+
+    if topic == "km":
+        km = _km_value(facts, advert)
+        return f"Tem {_group_digits(km)} km." if km is not None else None
+
+    if topic == "ano":
+        year = _year_value(facts)
+        return f"É de {year}." if year else None
+
+    if topic == "cilindrada":
+        c = _cilindrada_text(facts)
+        return f"A cilindrada é {c}." if c else None
+
+    if topic == "potencia":
+        p = _potencia_text(facts, advert)
+        return f"Tem {p}." if p else None
+
+    if topic == "combustivel":
+        f = _fuel_text(facts)
+        return f"O combustível é {f}." if f else None
+
+    if topic == "motor":
+        parts = [p for p in (_cilindrada_text(facts), _fuel_text(facts), _potencia_text(facts, advert)) if p]
+        return ("Tem motor " + ", ".join(parts) + ".") if parts else None
+
+    if topic == "caixa":
+        g = _gearbox_text(facts)
+        if not g:
+            return None
+        asked = None
+        if re.search(r"automatic", qn):
+            asked = "automática"
+        elif re.search(r"\bmanual\b", qn):
+            asked = "manual"
+        if asked:
+            if g.startswith(asked[:6]):
+                return f"Sim, a caixa é {g}."
+            return f"Não, a caixa é {g}."
+        return f"A caixa é {g}."
+
+    if topic == "donos":
+        value, _ = _fact_value(facts, "donos")
+        if not value:
+            return None
+        if re.search(r"unico|primeiro", normalize_text(value)):
+            return "Tem 1 dono."
+        m = re.search(r"\d+", value)
+        if m:
+            n = int(m.group(0))
+            return f"Tem {n} dono." if n == 1 else f"Tem {n} donos."
+        return f"Número de donos: {value}."
+
+    if topic == "cor":
+        value, _ = _fact_value(facts, "cor")
+        return f"A cor é {value.lower()}." if value else None
+
+    if topic == "portas":
+        value, _ = _fact_value(facts, "portas")
+        number = _to_number(value) if value else None
+        return f"Tem {int(number)} portas." if number and 0 < number < 10 else None
+
+    if topic == "lugares":
+        value, _ = _fact_value(facts, "lugares")
+        number = _to_number(value) if value else None
+        return f"Tem {int(number)} lugares." if number and 0 < number < 20 else None
+
+    if topic == "carroceria":
+        value, _ = _fact_value(facts, "carroceria")
+        return f"A carroçaria é {value}." if value else None
+
+    if topic == "modelo":
+        make, _ = _fact_value(facts, "marca")
+        model, _ = _fact_value(facts, "modelo")
+        name = " ".join(x for x in (make, model) if x)
+        if name:
+            return f"É um {name}."
+        title = _title(advert).strip()
+        return f"O anúncio refere: {title}." if title else None
+
+    if topic == "garantia":
+        value, _ = _fact_value(facts, "garantia")
+        if not value:
+            return None
+        norm = normalize_text(value)
+        if norm in _YES:
+            return "Sim, a viatura tem garantia."
+        if norm in _NO or re.fullmatch(r"\d+", norm):
+            return None  # sem dado fiável: usa o texto padrão da TC Car Premium
+        if re.match(r"\d", norm):
+            return f"Tem garantia de {value}."
+        return f"Garantia: {value}."
+
+    return None
+
+
+_GENERIC_SKIP_LABELS = {"title", "description", "status", "id", "url", "price", "name"}
+
+
+def generic_fact_answers(text, facts, limit=2):
+    """
+    Pergunta sem tema conhecido: se o cliente escreveu o nome de um campo que
+    existe no anúncio (ex.: 'ar condicionado'), responde com o valor desse campo.
+    """
+    qn = normalize_text(text)
+    qn = re.sub(r"[^a-z0-9 ]+", " ", qn)
+    answers, seen = [], set()
+    for fact in facts:
+        label = fact["label"]
+        if not label or fact["source"] == "campo":
+            continue
+        ln = re.sub(r"[^a-z0-9 ]+", " ", normalize_text(label)).strip()
+        if len(ln) < 3 or ln in _GENERIC_SKIP_LABELS or ln in seen:
+            continue
+        if re.search(rf"\b{re.escape(ln)}\b", qn):
+            seen.add(ln)
+            answers.append(f"{label}: {fact['value']}.")
+            if len(answers) >= limit:
+                break
+    return answers
+
+
+# ---- 3) ler o anúncio na API ------------------------------------------------
+def _advert_from_listing(key, access_token, refresh_token):
+    """Plano B: procura o anúncio na lista de anúncios da conta."""
+    cache = _ADVERT_LIST_CACHE
+    if time.time() - cache["ts"] > ADVERT_LIST_CACHE_SECONDS or key not in cache["by_id"]:
+        items, access_token, refresh_token = fetch_all(
+            "/adverts", "anúncios", access_token, refresh_token
+        )
+        cache["by_id"] = {str(i.get("id")): i for i in items if isinstance(i, dict) and i.get("id") is not None}
+        cache["ts"] = time.time()
+    return cache["by_id"].get(key) or {}, access_token, refresh_token
 
 
 def fetch_advert(advert_id, access_token, refresh_token):
@@ -347,27 +747,50 @@ def fetch_advert(advert_id, access_token, refresh_token):
     cached = _ADVERT_CACHE.get(key)
     if cached and time.time() - cached[0] < ADVERT_CACHE_SECONDS:
         return cached[1], access_token, refresh_token
+
+    advert = {}
     try:
         response, access_token, refresh_token = olx_request(
             "GET", f"/adverts/{key}", access_token, refresh_token
         )
-        if not response.ok:
-            debug_log(f"anúncio {key}: HTTP {response.status_code} (respostas usam texto genérico do anúncio)")
-            return {}, access_token, refresh_token
-        payload = response.json()
-        advert = payload.get("data", payload) if isinstance(payload, dict) else {}
-        if not isinstance(advert, dict):
-            advert = {}
+        if response.ok:
+            payload = response.json()
+            data = payload.get("data", payload) if isinstance(payload, dict) else {}
+            advert = data if isinstance(data, dict) else {}
+        else:
+            debug_log(f"anúncio {key}: GET /adverts/{key} devolveu HTTP {response.status_code}")
     except Exception as exc:
         debug_log(f"anúncio {key}: erro a ler ({exc})")
+
+    if not advert:
+        try:
+            advert, access_token, refresh_token = _advert_from_listing(key, access_token, refresh_token)
+            if advert:
+                debug_log(f"anúncio {key}: obtido pela lista de anúncios")
+        except Exception as exc:
+            debug_log(f"anúncio {key}: erro a ler a lista de anúncios ({exc})")
+
+    if not advert:
+        debug_log(f"anúncio {key}: SEM DADOS (as respostas não vão ter valores do anúncio)")
         return {}, access_token, refresh_token
 
     _ADVERT_CACHE[key] = (time.time(), advert)
-    debug_log(
-        f"anúncio {key}: campos={sorted(advert.keys())} preco={extract_price(advert)} "
-        f"km={extract_mileage(advert)} "
-        f"atributos={[_item_ident(i) for i in _attribute_items(advert)][:25]}"
-    )
+    if OLX_DEBUG:
+        facts = extract_facts(advert)
+        debug_log(f"anúncio {key}: campos={sorted(advert.keys())}")
+        debug_log(
+            f"anúncio {key}: factos="
+            + json.dumps(
+                [{"nome": f["ident"], "valor": f["value"][:50], "origem": f["source"]} for f in facts[:80]],
+                ensure_ascii=False,
+            )
+        )
+        debug_log(
+            f"anúncio {key}: resolução="
+            + json.dumps(
+                {t: _fact_sentence(t, facts, advert) for t in DATA_TOPICS}, ensure_ascii=False
+            )
+        )
     return advert, access_token, refresh_token
 
 
@@ -417,9 +840,35 @@ INTENT_PATTERNS = {
     ),
     "fotos": re.compile(r"\bfotos?\b|fotografias?|imagens|\bvideos?\b"),
     "km": re.compile(r"(?<![a-z])kms?\b|quilomet\w*|kilomet\w*"),
+    "ano": re.compile(
+        r"(?:que|qual|de que|em que|do que) ano\b|qual (?:e )?o ano\b"
+        r"|\bano (?:do|da|dele|dela|matricula|registo|fabrico|modelo)\b"
+        r"|\bano de (?:matricula|registo|fabrico|construcao)\b"
+        r"|primeira matricula|data de (?:matricula|registo)"
+    ),
+    "motor": re.compile(r"\bmotor\b|motorizacao|motorizado"),
+    "cilindrada": re.compile(r"cilindrada|\bcc\b|\bcm3\b"),
+    "potencia": re.compile(r"cavalos|\bcv\b|\bhp\b|\bbhp\b|potencia|\bkw\b"),
+    "combustivel": re.compile(
+        r"combustivel|\bdiesel\b|gasoleo|gasolina|\bgpl\b|\bgnc\b|hibrido|eletrico|electrico"
+    ),
+    "caixa": re.compile(
+        r"\bcaixa\b|\bautomatic[ao]s?\b|\bmanual\b(?! de)|transmissao|\bdsg\b|\bcambio\b"
+    ),
+    "donos": re.compile(
+        r"\bdonos\b|proprietarios|(?:primeiro|unico|segundo|1o|2o)\s+dono|\bdono\s+(?:anterior|unico)"
+    ),
+    "cor": re.compile(r"\bcor\b|\bcores\b"),
+    "portas": re.compile(r"\bportas\b"),
+    "lugares": re.compile(r"\blugares\b|\bassentos\b|quantas pessoas"),
+    "carroceria": re.compile(
+        r"carroceria|\bsuv\b|\bsedan\b|\bberlina\b|\bstation\b|\bcarrinha\b|\bmonovolume\b"
+        r"|\bhatchback\b|\bcabrio\w*|que tipo de (?:carro|viatura)"
+    ),
+    "modelo": re.compile(r"\bmodelo\b|\bmarca\b|que carro e\b|que viatura e\b"),
     "historico": re.compile(
         r"historico|revisoes|revisao|manutencao|livro de revisoes|correia|distribuicao|oleo"
-        r"|\bdonos?\b|primeiro dono|segundo dono|unico dono|acidente|sinistro"
+        r"|acidente|sinistro"
     ),
     "contacto": re.compile(
         r"contacto|contato|telefone|telemovel|whatsapp|whats app|\bzap\b|\bligar\b|\bligo\b"
@@ -436,7 +885,7 @@ PRICE_EXPLICIT = re.compile(
 )
 VISIT_STRONG = re.compile(r"marcar|marcacao|agendar|test[- ]?drive|teste de conducao|experimentar|conduzir")
 
-MAX_INTENTS_PER_REPLY = 3
+MAX_INTENTS_PER_REPLY = 5
 
 
 def detect_intents(text):
@@ -455,12 +904,17 @@ def detect_intents(text):
     # "Onde posso ver o carro?" é localização, não pedido de marcação.
     if "visita" in found and "localizacao" in found and not VISIT_STRONG.search(t):
         del found["visita"]
+    # A resposta sobre o motor já inclui cilindrada, combustível e potência.
+    if "motor" in found:
+        for sub in ("cilindrada", "potencia", "combustivel"):
+            found.pop(sub, None)
 
     return sorted(found, key=lambda name: found[name])[:MAX_INTENTS_PER_REPLY]
 
 
 HELP_CLOSING = "Onde podemos ajudar?"
 VISIT_CLOSING = "Se pretender, podemos combinar uma visita para a ver."
+CONTACT_CLOSING = "Para confirmarmos, pode contactar-nos pelo WhatsApp 962 148 367."
 
 # (corpo, fecho). O fecho só é usado quando há uma única intenção.
 STATIC_REPLIES = {
@@ -511,41 +965,60 @@ STATIC_REPLIES = {
     "contacto": ("Pode contactar-nos através do WhatsApp pelo número 962 148 367.", HELP_CLOSING),
 }
 
-
-def _intent_text(name, advert):
-    if name == "preco":
-        price = extract_price(advert)
-        if price:
-            return f"O valor da viatura é {price}.", VISIT_CLOSING
-        return "O valor da viatura está indicado no anúncio.", VISIT_CLOSING
-    if name == "km":
-        km = extract_mileage(advert)
-        if km:
-            return (
-                f"A viatura tem {_group_digits(km)} km.",
-                "Se tiver alguma questão sobre o histórico da viatura, podemos esclarecer.",
-            )
-        return (
-            "A quilometragem encontra-se indicada no anúncio. Se tiver alguma questão "
-            "específica sobre o histórico da viatura, podemos esclarecer.",
-            "",
-        )
-    return STATIC_REPLIES[name]
+# Só o preço mantém um fecho depois do valor; os restantes dados respondem direto.
+DATA_CLOSINGS = {"preco": VISIT_CLOSING}
 
 
-def compose_reply(intents, advert=None):
+def needs_advert(intents):
+    """Precisa de ler o anúncio quando há um tema de dados, ou quando não há tema nenhum."""
+    return (not intents) or any(i in DATA_TOPICS for i in intents)
+
+
+def _intent_text(name, facts, advert, text):
+    """(corpo, fecho, faltou_dado)"""
+    if name in DATA_TOPICS:
+        sentence = _fact_sentence(name, facts, advert, text)
+        if sentence:
+            return sentence, DATA_CLOSINGS.get(name, ""), False
+        if name == "garantia":  # sem dado no anúncio: texto padrão da TC Car Premium
+            body, closing = STATIC_REPLIES["garantia"]
+            return body, closing, False
+        return f"De momento não tenho {TOPIC_NOUN[name]} disponível.", "", True
+    body, closing = STATIC_REPLIES[name]
+    return body, closing, False
+
+
+def compose_reply(intents, advert=None, text=""):
     saudacao = greeting()
+    advert = advert if isinstance(advert, dict) else {}
+    facts = extract_facts(advert)
+
     if not intents:
+        generic = generic_fact_answers(text, facts)
+        if generic:
+            return " ".join([saudacao] + generic)
         return f"{saudacao} Obrigado pelo seu contacto com a TC Car Premium. Onde podemos ajudar?"
-    parts = [_intent_text(name, advert or {}) for name in intents]
+
+    parts = [_intent_text(name, facts, advert, text) for name in intents]
+    missing = any(p[2] for p in parts)
+    first_missing = True
+    for i, (body, closing, lacked) in enumerate(parts):
+        if lacked:
+            if not first_missing:  # evita repetir "De momento não tenho" várias vezes
+                parts[i] = (body.replace("De momento não tenho", "Também não tenho", 1), closing, lacked)
+            first_missing = False
     if len(parts) == 1:
-        body, closing = parts[0]
+        body, closing, _ = parts[0]
+        closing = CONTACT_CLOSING if missing else closing
         return " ".join(x for x in (saudacao, body, closing) if x)
-    return " ".join([saudacao] + [body for body, _ in parts])
+    bodies = [p[0] for p in parts]
+    if missing:
+        bodies.append(CONTACT_CLOSING)
+    return " ".join([saudacao] + bodies)
 
 
 def build_reply(text, advert=None):
-    return compose_reply(detect_intents(text), advert)
+    return compose_reply(detect_intents(text), advert, text)
 
 
 def debug_log(*parts):
@@ -924,11 +1397,11 @@ def process_new_messages(force_full=False):
             entry["intencoes"] = intents or ["generica"]
 
             advert = {}
-            if "preco" in intents or "km" in intents:
+            if needs_advert(intents):
                 advert, access_token, refresh_token = fetch_advert(
                     advert_id, access_token, refresh_token
                 )
-            reply = compose_reply(intents, advert)
+            reply = compose_reply(intents, advert, combined_text)
             debug_log(f"thread={thread_uuid} intencoes={entry['intencoes']}")
 
             send_response, access_token, refresh_token = send_message(
@@ -1169,17 +1642,25 @@ def olx_diagnostico():
                 f"/adverts/{aid}", access_token, refresh_token
             )
             adv = payload_a.get("data", payload_a) if isinstance(payload_a, dict) else {}
-            if not isinstance(adv, dict):
-                adv = {}
+            fonte = "detalhe"
+            if not isinstance(adv, dict) or not adv:
+                adv, fonte = a, "lista"
+            facts = extract_facts(adv)
+            sentences = {t: _fact_sentence(t, facts, adv) for t in DATA_TOPICS}
             detalhes.append(
                 {
                     "advert_id": aid,
-                    "http": info_a["http"],
-                    "campos": sorted(adv.keys()),
-                    "price_bruto": adv.get("price"),
+                    "http_detalhe": info_a["http"],
+                    "fonte_usada": fonte,
+                    "campos": sorted(adv.keys()) if isinstance(adv, dict) else [],
+                    "price_bruto": adv.get("price") if isinstance(adv, dict) else None,
                     "preco_que_o_bot_usa": extract_price(adv),
-                    "km_que_o_bot_usa": extract_mileage(adv),
-                    "atributos": [_item_ident(i) for i in _attribute_items(adv)][:40],
+                    "km_que_o_bot_usa": sentences.get("km"),
+                    "respostas_por_tema": sentences,
+                    "factos": [
+                        {"nome": f["ident"], "valor": f["value"][:60], "origem": f["source"]}
+                        for f in facts[:80]
+                    ],
                 }
             )
         out["anuncios_detalhe_para_respostas"] = detalhes
