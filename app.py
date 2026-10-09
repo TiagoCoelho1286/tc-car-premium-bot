@@ -5,7 +5,8 @@ import secrets
 import threading
 import time
 import unicodedata
-from datetime import datetime, timezone
+import zlib
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
@@ -46,7 +47,14 @@ _REPLIED_IDS = set()
 # Só relê as mensagens de uma conversa se ela mudou (total_count) ou tem não lidas.
 # De FULL_SCAN_EVERY em FULL_SCAN_EVERY ciclos relê tudo, como rede de segurança.
 FULL_SCAN_EVERY = max(1, int(os.environ.get("FULL_SCAN_EVERY", "20")))
-_THREAD_SEEN = {}
+# Conversas com atividade nas últimas HOT_THREAD_HOURS horas são lidas em TODOS os
+# ciclos (não dependem dos contadores da lista /threads, que podem estar desatualizados).
+# As restantes são lidas à vez: cada uma pelo menos de FULL_SCAN_EVERY em FULL_SCAN_EVERY ciclos.
+HOT_THREAD_HOURS = max(1, int(os.environ.get("HOT_THREAD_HOURS", "48")))
+OLX_DEBUG_VERBOSE = os.environ.get("OLX_DEBUG_VERBOSE", "false").lower() in {"1", "true", "yes", "sim"}
+_THREAD_SEEN = {}      # conversa -> total_count da última vez que ficou TRATADA
+_THREAD_ACTIVITY = {}  # conversa -> data da mensagem mais recente (naive, UTC)
+_LAST_CYCLE = {}
 _CYCLE_COUNT = 0
 process_lock = threading.Lock()
 
@@ -1251,6 +1259,29 @@ def initialize_without_replying(account_id, access_token, refresh_token):
     }
 
 
+def thread_read_reason(thread_key, thread, force_full, hot_after):
+    """
+    Porque é que esta conversa tem de ser lida neste ciclo (ou None para saltar).
+    A lista /threads NÃO é fiável para detetar mensagens novas, por isso os
+    contadores dela só aceleram; a garantia vem das conversas "quentes" e da rotação.
+    """
+    if force_full:
+        return "completa"
+    if thread_key not in _THREAD_SEEN:
+        return "nova"  # conversa nunca tratada (ou a anterior falhou)
+    if int(thread.get("unread_count") or 0) > 0:
+        return "nao_lida"
+    total = thread.get("total_count")
+    if total is not None and total != _THREAD_SEEN[thread_key]:
+        return "alterada"
+    activity = _THREAD_ACTIVITY.get(thread_key)
+    if activity is None or activity >= hot_after:
+        return "quente"
+    if zlib.crc32(thread_key.encode()) % FULL_SCAN_EVERY == _CYCLE_COUNT % FULL_SCAN_EVERY:
+        return "rotacao"
+    return None
+
+
 def process_new_messages(force_full=False):
     global _CYCLE_COUNT
     if not process_lock.acquire(blocking=False):
@@ -1269,8 +1300,11 @@ def process_new_messages(force_full=False):
         cutoff = parse_ts(baseline["cutoff_text"])
 
         _CYCLE_COUNT += 1
-        full_scan = force_full or _CYCLE_COUNT % FULL_SCAN_EVERY == 1 % FULL_SCAN_EVERY
+        full_scan = force_full
         skipped = 0
+        read_counts = {}
+        hot_after = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=HOT_THREAD_HOURS)
+        job_totals = {}
         threads, access_token, refresh_token = get_threads(access_token, refresh_token)
         replies_sent = 0
         messages_marked = 0
@@ -1293,16 +1327,12 @@ def process_new_messages(force_full=False):
                 continue
 
             total = thread.get("total_count")
-            unread = int(thread.get("unread_count") or 0)
-            last_total = _THREAD_SEEN.get(str(thread_uuid))
-            if (
-                not full_scan
-                and total is not None
-                and last_total == total
-                and unread == 0
-            ):
+            thread_key = str(thread_uuid)
+            reason = thread_read_reason(thread_key, thread, full_scan, hot_after)
+            if reason is None:
                 skipped += 1
                 continue
+            read_counts[reason] = read_counts.get(reason, 0) + 1
 
             try:
                 messages, access_token, refresh_token = get_messages(
@@ -1311,8 +1341,12 @@ def process_new_messages(force_full=False):
             except Exception as exc:
                 errors.append(f"{thread_uuid}: {exc}")
                 continue
-            if total is not None:
-                _THREAD_SEEN[str(thread_uuid)] = total
+
+            # Atividade mais recente da conversa (decide se é "quente").
+            stamps = [t for t in (parse_ts(m.get("created_at")) for m in messages) if t is not None]
+            if stamps:
+                _THREAD_ACTIVITY[thread_key] = max(stamps)
+            job_totals[thread_key] = total
 
             pending = []
             stats = {
@@ -1364,11 +1398,21 @@ def process_new_messages(force_full=False):
                 "unread_count": thread.get("unread_count"),
                 **stats,
             }
+            entry["motivo_leitura"] = reason
             thread_debug.append(entry)
-            debug_thread(thread, messages, stats, pending)
+            if pending or reason not in ("quente", "rotacao") or OLX_DEBUG_VERBOSE:
+                debug_thread(thread, messages, stats, pending)
 
             if pending:
                 jobs.append((thread_uuid, advert_id, pending, entry))
+            else:
+                _THREAD_SEEN[thread_key] = total  # nada a fazer: já está tratada
+
+        print(
+            f"[BOT] leitura: lidas={sum(read_counts.values())} {read_counts} "
+            f"puladas={skipped} pendentes={len(jobs)}",
+            flush=True,
+        )
 
         # Travão de segurança: muitas conversas "novas" ao mesmo tempo não é normal.
         if len(jobs) > MAX_REPLIES_PER_RUN:
@@ -1376,6 +1420,7 @@ def process_new_messages(force_full=False):
                 for message in pending:
                     mark_processed(message_key(message), thread_uuid, advert_id)
                     messages_marked += 1
+                _THREAD_SEEN[str(thread_uuid)] = job_totals.get(str(thread_uuid))
             print(
                 f"[BOT] TRAVÃO: {len(jobs)} conversas pendentes (máx. {MAX_REPLIES_PER_RUN}). "
                 "Nada foi enviado; as mensagens foram marcadas como processadas.",
@@ -1392,55 +1437,76 @@ def process_new_messages(force_full=False):
 
         # 2.ª fase: responder. Várias mensagens seguidas => UMA resposta.
         for thread_uuid, advert_id, pending, entry in jobs:
-            combined_text = " ".join((m.get("text") or "") for m in pending).strip()
-            intents = detect_intents(combined_text)
-            entry["intencoes"] = intents or ["generica"]
-
-            advert = {}
-            if needs_advert(intents):
-                advert, access_token, refresh_token = fetch_advert(
-                    advert_id, access_token, refresh_token
-                )
-            reply = compose_reply(intents, advert, combined_text)
-            debug_log(f"thread={thread_uuid} intencoes={entry['intencoes']}")
-
-            send_response, access_token, refresh_token = send_message(
-                thread_uuid,
-                reply,
-                access_token,
-                refresh_token,
-            )
-
-            if not send_response.ok:
-                _THREAD_SEEN.pop(str(thread_uuid), None)  # voltar a ler no ciclo seguinte
-                errors.append(
-                    f"{thread_uuid}: falha ao responder HTTP "
-                    f"{send_response.status_code} - {send_response.text[:200]}"
-                )
-                continue
-
-            # Só marcamos como processadas DEPOIS de o OLX confirmar o envio.
-            for message in pending:
-                mid = message_key(message)
-                _REPLIED_IDS.add(mid)  # evita repetir mesmo que a base de dados falhe
-                try:
-                    mark_processed(mid, thread_uuid, advert_id)
-                    messages_marked += 1
-                except Exception as exc:
-                    errors.append(f"{thread_uuid}: resposta enviada mas não ficou registada ({exc})")
-
-            replies_sent += 1
-
-            # Não é crítico para o envio; apenas tentamos limpar o não-lido.
             try:
-                mark_thread_read(thread_uuid, access_token, refresh_token)
-            except Exception:
-                pass
+                combined_text = " ".join((m.get("text") or "") for m in pending).strip()
+                intents = detect_intents(combined_text)
+                entry["intencoes"] = intents or ["generica"]
+
+                advert = {}
+                if needs_advert(intents):
+                    advert, access_token, refresh_token = fetch_advert(
+                        advert_id, access_token, refresh_token
+                    )
+                reply = compose_reply(intents, advert, combined_text)
+                debug_log(f"thread={thread_uuid} intencoes={entry['intencoes']}")
+
+                send_response, access_token, refresh_token = send_message(
+                    thread_uuid,
+                    reply,
+                    access_token,
+                    refresh_token,
+                )
+
+                if not send_response.ok:
+                    errors.append(
+                        f"{thread_uuid}: falha ao responder HTTP "
+                        f"{send_response.status_code} - {send_response.text[:200]}"
+                    )
+                    continue  # continua fora de _THREAD_SEEN: volta a ser lida no ciclo seguinte
+
+                # Só marcamos como processadas DEPOIS de o OLX confirmar o envio.
+                for message in pending:
+                    mid = message_key(message)
+                    _REPLIED_IDS.add(mid)  # evita repetir mesmo que a base de dados falhe
+                    try:
+                        mark_processed(mid, thread_uuid, advert_id)
+                        messages_marked += 1
+                    except Exception as exc:
+                        errors.append(f"{thread_uuid}: resposta enviada mas não ficou registada ({exc})")
+
+                _THREAD_SEEN[str(thread_uuid)] = job_totals.get(str(thread_uuid))
+                replies_sent += 1
+
+                # Não é crítico para o envio; apenas tentamos limpar o não-lido.
+                try:
+                    mark_thread_read(thread_uuid, access_token, refresh_token)
+                except Exception:
+                    pass
+            except Exception as exc:
+                errors.append(f"{thread_uuid}: erro a responder ({type(exc).__name__}: {exc})")
+
+        for problem in errors:
+            print(f"[BOT] AVISO: {problem}", flush=True)
+        _LAST_CYCLE.clear()
+        _LAST_CYCLE.update(
+            {
+                "quando_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "conversas": len(threads),
+                "lidas": sum(read_counts.values()),
+                "motivos": dict(read_counts),
+                "puladas": skipped,
+                "pendentes": len(jobs),
+                "respostas": replies_sent,
+                "erros": len(errors),
+            }
+        )
 
         return {
             "estado": "ok",
             "threads_verificadas": len(threads),
             "threads_sem_alteracoes": skipped,
+            "threads_lidas": sum(read_counts.values()),
+            "motivos_leitura": read_counts,
             "leitura_completa": full_scan,
             "mensagens_nao_lidas_api": unread_total,
             "respostas_enviadas": replies_sent,
@@ -1450,6 +1516,7 @@ def process_new_messages(force_full=False):
         }
 
     except Exception as exc:
+        print(f"[BOT] ERRO no ciclo: {type(exc).__name__}: {exc}", flush=True)
         return {"erro": str(exc)}
     finally:
         process_lock.release()
@@ -1736,6 +1803,11 @@ def olx_estado():
             baseline = get_baseline(account_id)
             info["historico_inicial_ignorado"] = baseline is not None
             info["marco_created_at"] = baseline["cutoff_text"] if baseline else None
+            info["ultimo_ciclo"] = dict(_LAST_CYCLE) or None
+            info["conversas_quentes"] = sum(
+                1 for v in _THREAD_ACTIVITY.values()
+                if v >= datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=HOT_THREAD_HOURS)
+            )
         except Exception as exc:
             info["erro"] = str(exc)
     return jsonify(info)
