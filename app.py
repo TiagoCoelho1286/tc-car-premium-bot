@@ -4,6 +4,7 @@ import re
 import secrets
 import threading
 import time
+import tempfile
 import unicodedata
 import zlib
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,11 @@ from zoneinfo import ZoneInfo
 import requests
 from flask import Flask, jsonify, redirect, request, session
 from supabase import create_client
+
+try:  # bloqueio entre processos (Linux/Render). Sem ele o bot continua a funcionar.
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
 
 
 app = Flask(__name__)
@@ -57,6 +63,19 @@ _THREAD_ACTIVITY = {}  # conversa -> data da mensagem mais recente (naive, UTC)
 _LAST_CYCLE = {}
 _CYCLE_COUNT = 0
 process_lock = threading.Lock()
+
+# Mensagens recebidas há mais de MAX_MESSAGE_AGE_MINUTES nunca recebem resposta automática
+# (ficam registadas como tratadas). Protege o caso do bot ter estado parado e voltar a arrancar.
+# 0 desliga esta proteção.
+MAX_MESSAGE_AGE_MINUTES = max(0, int(os.environ.get("MAX_MESSAGE_AGE_MINUTES", "180")))
+
+# Estado do poller partilhado entre processos (um ficheiro por contentor) e bloqueio de ciclos.
+POLLER_STATE_FILE = os.path.join(tempfile.gettempdir(), "tc_olx_poller_state.json")
+CYCLE_LOCK_FILE = os.path.join(tempfile.gettempdir(), "tc_olx_cycle.lock")
+_POLLER = {"thread": None, "pid": None, "motivo": None, "iniciado_utc": None}
+_POLLER_GUARD = threading.Lock()
+_POLLER_STATE = {}
+_CYCLE_FD = None
 
 
 def api_items(response):
@@ -1282,12 +1301,41 @@ def thread_read_reason(thread_key, thread, force_full, hot_after):
     return None
 
 
+def _acquire_cycle_lock():
+    """(ocupado, fd). Impede dois processos (vários workers) de processarem ao mesmo tempo."""
+    if fcntl is None:
+        return False, None
+    try:
+        fd = os.open(CYCLE_LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return False, None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return True, None
+    return False, fd
+
+
+def _release_cycle_lock(fd):
+    if fd is not None:
+        try:
+            os.close(fd)  # fechar o descritor liberta o bloqueio
+        except OSError:
+            pass
+
+
 def process_new_messages(force_full=False):
-    global _CYCLE_COUNT
+    global _CYCLE_COUNT, _CYCLE_FD
     if not process_lock.acquire(blocking=False):
         return {"estado": "já existe um processamento em curso"}
 
+    cycle_fd = None
     try:
+        busy, cycle_fd = _acquire_cycle_lock()
+        _CYCLE_FD = cycle_fd
+        if busy:
+            return {"estado": "já existe um processamento em curso (outro processo)"}
         access_token, refresh_token = get_latest_tokens()
         if not access_token:
             return {"erro": "Não existe nenhum token OLX guardado."}
@@ -1303,7 +1351,9 @@ def process_new_messages(force_full=False):
         full_scan = force_full
         skipped = 0
         read_counts = {}
-        hot_after = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=HOT_THREAD_HOURS)
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        hot_after = now_naive - timedelta(hours=HOT_THREAD_HOURS)
+        stale_total = 0
         job_totals = {}
         threads, access_token, refresh_token = get_threads(access_token, refresh_token)
         replies_sent = 0
@@ -1357,6 +1407,7 @@ def process_new_messages(force_full=False):
                 "sem_id": 0,
                 "sem_data": 0,
                 "anteriores_ao_marco": 0,
+                "antigas_demais": 0,
                 "ja_processadas": 0,
             }
             for message in messages:
@@ -1387,7 +1438,25 @@ def process_new_messages(force_full=False):
                         stats["anteriores_ao_marco"] += 1
                         continue
 
-                if mid in _REPLIED_IDS or is_processed(mid):
+                if mid in _REPLIED_IDS:
+                    stats["ja_processadas"] += 1
+                    continue
+
+                # Mensagem demasiado antiga (ex.: o bot esteve parado): regista como tratada, sem responder.
+                if MAX_MESSAGE_AGE_MINUTES > 0:
+                    sent_at = parse_ts(message.get("created_at"))
+                    if sent_at is not None and now_naive - sent_at > timedelta(minutes=MAX_MESSAGE_AGE_MINUTES):
+                        try:
+                            if not is_processed(mid):
+                                mark_processed(mid, thread_uuid, advert_id)
+                            _REPLIED_IDS.add(mid)
+                            stats["antigas_demais"] += 1
+                            stale_total += 1
+                        except Exception as exc:
+                            errors.append(f"{thread_uuid}: não foi possível registar mensagem antiga ({exc})")
+                        continue
+
+                if is_processed(mid):
                     stats["ja_processadas"] += 1
                     continue
                 pending.append(message)
@@ -1413,6 +1482,12 @@ def process_new_messages(force_full=False):
             f"puladas={skipped} pendentes={len(jobs)}",
             flush=True,
         )
+        if stale_total:
+            print(
+                f"[BOT] {stale_total} mensagem(ns) com mais de {MAX_MESSAGE_AGE_MINUTES} min "
+                "marcada(s) como tratada(s), sem resposta (histórico antigo).",
+                flush=True,
+            )
 
         # Travão de segurança: muitas conversas "novas" ao mesmo tempo não é normal.
         if len(jobs) > MAX_REPLIES_PER_RUN:
@@ -1519,22 +1594,136 @@ def process_new_messages(force_full=False):
         print(f"[BOT] ERRO no ciclo: {type(exc).__name__}: {exc}", flush=True)
         return {"erro": str(exc)}
     finally:
+        _release_cycle_lock(cycle_fd)
+        _CYCLE_FD = None
         process_lock.release()
 
 
+def _now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _seconds_since(text):
+    try:
+        then = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int((datetime.now(timezone.utc) - then).total_seconds()))
+
+
+def _write_poller_state(**changes):
+    """Regista o 'batimento' do poller num ficheiro (visível em /olx/estado por qualquer processo)."""
+    _POLLER_STATE.update(changes)
+    try:
+        tmp = f"{POLLER_STATE_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(_POLLER_STATE, fh, ensure_ascii=False, default=str)
+        os.replace(tmp, POLLER_STATE_FILE)
+    except Exception:
+        pass  # o batimento nunca pode impedir um ciclo
+
+
+def _read_poller_state():
+    try:
+        with open(POLLER_STATE_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _result_summary(result):
+    if not isinstance(result, dict):
+        return str(result)
+    if "erro" in result:
+        return f"erro: {result['erro']}"
+    estado = result.get("estado", "?")
+    if estado == "ok":
+        return f"ok (respostas={result.get('respostas_enviadas', 0)}, erros={len(result.get('erros', []))})"
+    return str(estado)
+
+
 def polling_loop():
+    pid = os.getpid()
     # Pequeno atraso para o servidor arrancar antes da primeira consulta.
     time.sleep(10)
-    while True:
-        started = time.monotonic()
-        try:
-            process_new_messages()
-        except Exception as exc:
-            print(f"[BOT] Erro no ciclo automático: {exc}", flush=True)
-        elapsed = time.monotonic() - started
-        if OLX_DEBUG or elapsed > POLL_SECONDS:
+    try:
+        while True:
+            started = time.monotonic()
+            _write_poller_state(pid=pid, ciclo_em_curso=True, ultimo_inicio_utc=_now_utc_str())
+            try:
+                resultado = _result_summary(process_new_messages())
+            except Exception as exc:
+                resultado = f"erro: {type(exc).__name__}: {exc}"
+                print(f"[BOT] Erro no ciclo automático: {exc}", flush=True)
+            elapsed = time.monotonic() - started
             print(f"[BOT] ciclo concluído em {elapsed:.1f}s (intervalo alvo {POLL_SECONDS}s)", flush=True)
-        time.sleep(max(1.0, POLL_SECONDS - elapsed))
+            _write_poller_state(
+                pid=pid,
+                ciclo_em_curso=False,
+                ultimo_fim_utc=_now_utc_str(),
+                ultima_duracao_s=round(elapsed, 1),
+                ultimo_resultado=resultado,
+                ciclos=int(_POLLER_STATE.get("ciclos", 0)) + 1,
+                detalhe=dict(_LAST_CYCLE),
+            )
+            time.sleep(max(1.0, POLL_SECONDS - elapsed))
+    except BaseException as exc:
+        print(f"[BOT] poller TERMINOU: {type(exc).__name__}: {exc}", flush=True)
+        _write_poller_state(ciclo_em_curso=False, terminou_utc=_now_utc_str(), terminou_motivo=f"{type(exc).__name__}: {exc}")
+        raise
+
+
+def poller_alive():
+    thread = _POLLER.get("thread")
+    return bool(thread is not None and thread.is_alive() and _POLLER.get("pid") == os.getpid())
+
+
+def start_poller(motivo="arranque"):
+    """Arranca o ciclo automático neste processo (idempotente). Devolve True se arrancou agora."""
+    if not AUTO_POLL:
+        return False
+    with _POLLER_GUARD:
+        if poller_alive():
+            return False
+        thread = threading.Thread(target=polling_loop, daemon=True, name="olx-poller")
+        _POLLER.update(thread=thread, pid=os.getpid(), motivo=motivo, iniciado_utc=_now_utc_str())
+        _write_poller_state(pid=os.getpid(), iniciado_utc=_POLLER["iniciado_utc"], motivo=motivo, ciclo_em_curso=False)
+        thread.start()
+    print(
+        f"[BOT] auto_poll iniciado (pid={os.getpid()}, motivo={motivo}, intervalo alvo {POLL_SECONDS}s)",
+        flush=True,
+    )
+    return True
+
+
+def _after_fork_in_child():
+    """
+    Um worker criado por fork() (Gunicorn com --preload) NÃO herda as threads do processo-mestre
+    e herda os bloqueios no estado em que estavam. Repõe tudo e arranca o seu próprio poller.
+    """
+    global process_lock, _POLLER_GUARD, _CYCLE_FD
+    process_lock = threading.Lock()
+    _POLLER_GUARD = threading.Lock()
+    if _CYCLE_FD is not None:  # não manter vivo o bloqueio de ciclo do processo-mestre
+        try:
+            os.close(_CYCLE_FD)
+        except OSError:
+            pass
+        _CYCLE_FD = None
+    _POLLER.update(thread=None, pid=None, motivo=None, iniciado_utc=None)
+    start_poller("worker novo (fork)")
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
+@app.before_request
+def _ensure_poller_running():
+    # Rede de segurança: se a thread não existir neste processo (ou tiver morrido), volta a arrancá-la.
+    if AUTO_POLL and not poller_alive():
+        start_poller("auto-reparação (pedido HTTP)")
 
 
 @app.route("/")
@@ -1787,6 +1976,53 @@ def olx_diagnostico():
         return jsonify(out), 500
 
 
+def poller_status():
+    """Estado real do ciclo automático, lido do 'batimento' gravado pelo poller (qualquer processo)."""
+    state = _read_poller_state()
+    since_end = _seconds_since(state.get("ultimo_fim_utc"))
+    since_start = _seconds_since(state.get("ultimo_inicio_utc"))
+    limite = max(3 * POLL_SECONDS, 45)
+    alerta = None
+    if not AUTO_POLL:
+        alerta = "AUTO_POLL está desligado (variável de ambiente)."
+    elif state.get("terminou_utc"):
+        alerta = f"o poller terminou: {state.get('terminou_motivo')}"
+    elif state.get("ciclo_em_curso") and since_start is not None and since_start > limite:
+        alerta = f"há um ciclo em curso há {since_start}s (pode estar bloqueado num pedido)."
+    elif since_end is None and not state:
+        alerta = "ainda não há registo de nenhum ciclo (o primeiro corre ~10 s depois do arranque)."
+    elif since_end is not None and since_end > limite and not state.get("ciclo_em_curso"):
+        alerta = f"o último ciclo terminou há {since_end}s (esperado: a cada {POLL_SECONDS}s)."
+    saudavel = AUTO_POLL and alerta is None and since_end is not None
+    if state.get("ultimo_fim_utc"):
+        ultimo_ciclo = {
+            "fim_utc": state.get("ultimo_fim_utc"),
+            "ha_segundos": since_end,
+            "duracao_s": state.get("ultima_duracao_s"),
+            "resultado": state.get("ultimo_resultado"),
+            "ciclos_executados": state.get("ciclos"),
+            "detalhe": dict(_LAST_CYCLE) or state.get("detalhe") or None,
+        }
+    elif poller_alive():
+        ultimo_ciclo = {"resultado": "a aguardar o 1.º ciclo (o poller espera 10 s depois do arranque)"}
+    else:
+        ultimo_ciclo = {"resultado": "nenhum ciclo registado e o poller NÃO está a correr neste processo"}
+    return {
+        "poller": {
+            "saudavel": bool(saudavel),
+            "alerta": alerta,
+            "este_processo": {
+                "pid": os.getpid(),
+                "thread_viva": poller_alive(),
+                "iniciado_utc": _POLLER.get("iniciado_utc"),
+                "motivo_arranque": _POLLER.get("motivo"),
+            },
+            "ultimo_registo": state or None,
+        },
+        "ultimo_ciclo": ultimo_ciclo,
+    }
+
+
 @app.route("/olx/estado")
 def olx_estado():
     access_token, refresh_token = get_latest_tokens()
@@ -1796,6 +2032,7 @@ def olx_estado():
         "historico_inicial_ignorado": False,
         "auto_poll": AUTO_POLL,
         "intervalo_segundos": POLL_SECONDS,
+        **poller_status(),
     }
     if access_token:
         try:
@@ -1803,7 +2040,6 @@ def olx_estado():
             baseline = get_baseline(account_id)
             info["historico_inicial_ignorado"] = baseline is not None
             info["marco_created_at"] = baseline["cutoff_text"] if baseline else None
-            info["ultimo_ciclo"] = dict(_LAST_CYCLE) or None
             info["conversas_quentes"] = sum(
                 1 for v in _THREAD_ACTIVITY.values()
                 if v >= datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=HOT_THREAD_HOURS)
@@ -1813,9 +2049,11 @@ def olx_estado():
     return jsonify(info)
 
 
-# Inicia o ciclo automático apenas uma vez por processo.
+# Inicia o ciclo automático ao carregar a aplicação (Gunicorn: dentro do worker).
 if AUTO_POLL:
-    threading.Thread(target=polling_loop, daemon=True, name="olx-poller").start()
+    start_poller("arranque")
+else:
+    print("[BOT] auto_poll DESLIGADO (AUTO_POLL=false): o bot só processa em /olx/processar", flush=True)
 
 
 if __name__ == "__main__":
