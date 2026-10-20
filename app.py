@@ -347,14 +347,14 @@ def extract_price(advert):
     else:
         value = _to_number(price)
 
-    # Valores simbólicos (ex.: 1 €) não são preços reais.
-    if value is None or value < 100:
+    # Só o valor simbólico (0 ou 1 €) não é preço real; 75 € de uma peça é um preço válido.
+    if value is None or value <= 1:
         value = None
         for item in _attribute_items(advert):
             ident = _item_ident(item)
             if re.search(r"price|preco", ident) and not re.search(r"negoci|trade|troca|unit", ident):
                 candidate = _to_number(_item_value(item))
-                if candidate and candidate >= 100:
+                if candidate and candidate > 1:
                     value = candidate
                     break
     if value is None:
@@ -625,13 +625,33 @@ def _gearbox_text(facts):
     return _mapped(value, _GEARBOX_MAP) if value else None
 
 
+def is_vehicle(facts):
+    """True se o anúncio tem dados de viatura (km, combustível, caixa, motor, marca...)."""
+    return any(_fact_value(facts, t)[0] for t in ("km", "combustivel", "caixa", "cilindrada", "potencia", "marca"))
+
+
+def _pretty_name(value):
+    """'mito' -> 'Mito'; 'astra-gtc' -> 'Astra Gtc'; 'a3' -> 'A3'; mantém siglas já em maiúsculas."""
+    words = []
+    for token in re.split(r"[\s_\-]+", str(value).strip()):
+        if not token:
+            continue
+        if token.isupper() or (any(c.isdigit() for c in token) and len(token) <= 4):
+            words.append(token.upper() if any(c.isdigit() for c in token) else token)
+        else:
+            words.append(token[:1].upper() + token[1:].lower())
+    return " ".join(words)
+
+
 def _fact_sentence(topic, facts, advert, text=""):
     """Frase com o VALOR CONCRETO do anúncio, ou None se o dado não existir."""
     qn = normalize_text(text)
 
     if topic == "preco":
         price = extract_price(advert)
-        return f"O valor da viatura é {price}." if price else None
+        if not price:
+            return None
+        return f"O valor da viatura é {price}." if is_vehicle(facts) else f"O preço é {price}."
 
     if topic == "km":
         km = _km_value(facts, advert)
@@ -705,7 +725,7 @@ def _fact_sentence(topic, facts, advert, text=""):
     if topic == "modelo":
         make, _ = _fact_value(facts, "marca")
         model, _ = _fact_value(facts, "modelo")
-        name = " ".join(x for x in (make, model) if x)
+        name = " ".join(_pretty_name(x) for x in (make, model) if x)
         if name:
             return f"É um {name}."
         title = _title(advert).strip()
@@ -1010,6 +1030,9 @@ def _intent_text(name, facts, advert, text):
         if name == "garantia":  # sem dado no anúncio: texto padrão da TC Car Premium
             body, closing = STATIC_REPLIES["garantia"]
             return body, closing, False
+        title = _title(advert).strip()
+        if title and not is_vehicle(facts):
+            return f"De momento não tenho {TOPIC_NOUN[name]} disponível para «{title}».", "", True
         return f"De momento não tenho {TOPIC_NOUN[name]} disponível.", "", True
     body, closing = STATIC_REPLIES[name]
     return body, closing, False
